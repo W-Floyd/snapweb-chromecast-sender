@@ -13,17 +13,10 @@ def main():
 
     host = sys.argv[1]
     cast = None
-    browser = None
     try:
         import pychromecast
 
-        # pychromecast 13+ takes host as a plain string; older versions used a tuple.
-        try:
-            cast, browser = pychromecast.get_chromecast_from_host(host, port=8009)
-        except TypeError:
-            cast, browser = pychromecast.get_chromecast_from_host(
-                (host, 8009, None, None, None)
-            )
+        cast = pychromecast.get_chromecast_from_host((host, 8009, None, None, None))
 
         cast.wait(timeout=10)
         s = cast.status
@@ -47,11 +40,6 @@ def main():
         if cast:
             try:
                 cast.disconnect()
-            except Exception:
-                pass
-        if browser:
-            try:
-                browser.stop_discovery()
             except Exception:
                 pass
 
