@@ -1,6 +1,7 @@
 services:
   chromecast-sender:
     image: ghcr.io/w-floyd/snapweb-chromecast-sender:main
+    # build: .
     ports:
       - "8083:8083"
     volumes:
