@@ -10,6 +10,7 @@ FROM python:3.12-slim
 RUN pip install --no-cache-dir catt
 
 COPY --from=builder /build/server /usr/local/bin/server
+COPY scripts/ /usr/local/lib/chromecast/
 COPY static/ /static/
 
 VOLUME ["/config"]

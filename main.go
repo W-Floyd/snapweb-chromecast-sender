@@ -111,6 +111,10 @@ func runCatt(timeout time.Duration, args ...string) (string, error) {
 }
 
 func getDeviceStatus(dev DeviceConfig) DeviceStatus {
+	if dev.Host != "" {
+		return getPychromecastStatus(dev)
+	}
+	// Fall back to catt when no host IP is configured.
 	args := append(cattDeviceArgs(dev), "status")
 	out, err := runCatt(10*time.Second, args...)
 	ds := DeviceStatus{Name: dev.Name, State: "unknown"}
@@ -118,7 +122,6 @@ func getDeviceStatus(dev DeviceConfig) DeviceStatus {
 		ds.Error = strings.TrimSpace(out)
 		return ds
 	}
-	// catt doesn't report state for web-page casts; use internal tracker.
 	if isCasting(dev.Name) {
 		ds.State = "Playing"
 	} else {
@@ -128,10 +131,46 @@ func getDeviceStatus(dev DeviceConfig) DeviceStatus {
 	for scanner.Scan() {
 		line := scanner.Text()
 		if after, ok := strings.CutPrefix(line, "State: "); ok {
-			ds.State = strings.TrimSpace(after) // real media state wins if present
+			ds.State = strings.TrimSpace(after)
 		} else if after, ok := strings.CutPrefix(line, "Content: "); ok {
 			ds.URL = strings.TrimSpace(after)
 		}
+	}
+	return ds
+}
+
+func getPychromecastStatus(dev DeviceConfig) DeviceStatus {
+	ds := DeviceStatus{Name: dev.Name, State: "unknown"}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "python3", "/usr/local/lib/chromecast/cc_status.py", dev.Host).Output()
+	if err != nil {
+		ds.Error = strings.TrimSpace(string(out))
+		return ds
+	}
+	var result struct {
+		AppID       *string `json:"app_id"`
+		DisplayName string  `json:"display_name"`
+		IsIdle      bool    `json:"is_idle"`
+		Error       string  `json:"error"`
+	}
+	if err := json.Unmarshal(out, &result); err != nil {
+		ds.Error = string(out)
+		return ds
+	}
+	if result.Error != "" {
+		ds.Error = result.Error
+		return ds
+	}
+	if result.IsIdle {
+		ds.State = "Idle"
+		setCastState(dev.Name, false)
+	} else {
+		ds.State = result.DisplayName
+		if ds.State == "" {
+			ds.State = "Playing"
+		}
+		setCastState(dev.Name, true)
 	}
 	return ds
 }
