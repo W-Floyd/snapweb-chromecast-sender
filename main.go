@@ -143,19 +143,15 @@ func getPychromecastStatus(dev DeviceConfig) DeviceStatus {
 	ds := DeviceStatus{Name: dev.Name, State: "unknown"}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "python3", "/usr/local/lib/chromecast/cc_status.py", dev.Host).Output()
-	if err != nil {
-		ds.Error = strings.TrimSpace(string(out))
-		return ds
-	}
+	// CombinedOutput so any Python tracebacks appear in ds.Error
+	out, _ := exec.CommandContext(ctx, "python3", "/usr/local/lib/chromecast/cc_status.py", dev.Host).CombinedOutput()
 	var result struct {
-		AppID       *string `json:"app_id"`
-		DisplayName string  `json:"display_name"`
-		IsIdle      bool    `json:"is_idle"`
-		Error       string  `json:"error"`
+		DisplayName string `json:"display_name"`
+		IsIdle      bool   `json:"is_idle"`
+		Error       string `json:"error"`
 	}
 	if err := json.Unmarshal(out, &result); err != nil {
-		ds.Error = string(out)
+		ds.Error = strings.TrimSpace(string(out))
 		return ds
 	}
 	if result.Error != "" {

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Query a Chromecast device by IP and print JSON status."""
+"""Query a Chromecast device by IP and print JSON status to stdout."""
 import sys
 import json
-import pychromecast
+import traceback
 
 BACKDROP_APP_ID = "E8C28D3C"
 
@@ -15,14 +15,21 @@ def main():
     cast = None
     browser = None
     try:
-        cast, browser = pychromecast.get_chromecast_from_host(
-            (host, 8009, None, None, None)
-        )
+        import pychromecast
+
+        # pychromecast 13+ takes host as a plain string; older versions used a tuple.
+        try:
+            cast, browser = pychromecast.get_chromecast_from_host(host, port=8009)
+        except TypeError:
+            cast, browser = pychromecast.get_chromecast_from_host(
+                (host, 8009, None, None, None)
+            )
+
         cast.wait(timeout=10)
         s = cast.status
 
         app_id = s.app_id
-        display_name = s.display_name or ""
+        display_name = (s.display_name or "").strip()
         is_idle = s.is_stand_by or app_id is None or app_id == BACKDROP_APP_ID
 
         print(json.dumps({
@@ -32,8 +39,9 @@ def main():
             "volume_level": round(s.volume_level, 2),
             "volume_muted": s.volume_muted,
         }))
+
     except Exception as e:
-        print(json.dumps({"error": str(e)}))
+        print(json.dumps({"error": str(e), "detail": traceback.format_exc()}))
         sys.exit(1)
     finally:
         if cast:
