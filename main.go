@@ -46,7 +46,24 @@ var (
 	cfg     Config
 	cfgMu   sync.RWMutex
 	cfgPath = "/config/config.json"
+
+	// castStates tracks devices we have actively cast to.
+	// catt gives no signal for web-page cast state, so we track it ourselves.
+	castStates   = map[string]bool{}
+	castStatesMu sync.RWMutex
 )
+
+func setCastState(name string, playing bool) {
+	castStatesMu.Lock()
+	castStates[name] = playing
+	castStatesMu.Unlock()
+}
+
+func isCasting(name string) bool {
+	castStatesMu.RLock()
+	defer castStatesMu.RUnlock()
+	return castStates[name]
+}
 
 func loadConfig() {
 	data, err := os.ReadFile(cfgPath)
@@ -101,13 +118,17 @@ func getDeviceStatus(dev DeviceConfig) DeviceStatus {
 		ds.Error = strings.TrimSpace(out)
 		return ds
 	}
-	// Default to Idle on a successful call — catt omits "State:" when nothing is casting.
-	ds.State = "Idle"
+	// catt doesn't report state for web-page casts; use internal tracker.
+	if isCasting(dev.Name) {
+		ds.State = "Playing"
+	} else {
+		ds.State = "Idle"
+	}
 	scanner := bufio.NewScanner(strings.NewReader(out))
 	for scanner.Scan() {
 		line := scanner.Text()
 		if after, ok := strings.CutPrefix(line, "State: "); ok {
-			ds.State = strings.TrimSpace(after)
+			ds.State = strings.TrimSpace(after) // real media state wins if present
 		} else if after, ok := strings.CutPrefix(line, "Content: "); ok {
 			ds.URL = strings.TrimSpace(after)
 		}
@@ -137,14 +158,16 @@ func monitorDevices() {
 		if url == "" {
 			continue
 		}
-		status := getDeviceStatus(dev)
-		if strings.EqualFold(status.State, "idle") {
-			log.Printf("auto-casting to %q: %s", dev.Name, url)
-			args := append(cattDeviceArgs(dev), "cast_site", url)
-			out, err := runCatt(30*time.Second, args...)
-			if err != nil {
-				log.Printf("cast error for %q: %v — %s", dev.Name, err, strings.TrimSpace(out))
-			}
+		if isCasting(dev.Name) {
+			continue
+		}
+		log.Printf("auto-casting to %q: %s", dev.Name, url)
+		args := append(cattDeviceArgs(dev), "cast_site", url)
+		out, err := runCatt(30*time.Second, args...)
+		if err != nil {
+			log.Printf("cast error for %q: %v — %s", dev.Name, err, strings.TrimSpace(out))
+		} else {
+			setCastState(dev.Name, true)
 		}
 	}
 }
@@ -484,6 +507,8 @@ func handleCast(w http.ResponseWriter, r *http.Request) {
 		out, err := runCatt(30*time.Second, args...)
 		if err != nil {
 			log.Printf("cast %q -> %s: %v — %s", req.Name, req.URL, err, strings.TrimSpace(out))
+		} else {
+			setCastState(req.Name, true)
 		}
 	}()
 	w.Header().Set("Content-Type", "application/json")
@@ -513,6 +538,8 @@ func handleStop(w http.ResponseWriter, r *http.Request) {
 		out, err := runCatt(15*time.Second, args...)
 		if err != nil {
 			log.Printf("stop %q: %v — %s", req.Name, err, strings.TrimSpace(out))
+		} else {
+			setCastState(req.Name, false)
 		}
 	}()
 	w.Header().Set("Content-Type", "application/json")
