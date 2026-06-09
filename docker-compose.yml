@@ -1,0 +1,24 @@
+services:
+  chromecast-sender:
+    build: .
+    ports:
+      - "8083:8083"
+    volumes:
+      - ./config:/config
+    environment:
+      CONFIG_PATH: /config/config.json
+      PORT: "8083"
+    restart: unless-stopped
+
+  # Uncomment below (and remove the service above) when deploying on Linux
+  # to enable mDNS-based device scanning. network_mode: host is incompatible
+  # with ports: mapping — the server is accessible directly on the host port.
+  # chromecast-sender-linux:
+  #   build: .
+  #   network_mode: host
+  #   volumes:
+  #     - ./config:/config
+  #   environment:
+  #     CONFIG_PATH: /config/config.json
+  #     PORT: "8083"
+  #   restart: unless-stopped

@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chromecast Sender</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
+  <style>
+    [x-cloak] { display: none !important; }
+  </style>
+</head>
+<body class="bg-slate-900 text-slate-100 min-h-screen" x-data="app()" x-init="init()" x-cloak>
+
+  <!-- Notification toast -->
+  <div x-show="notification" x-transition
+       :class="notification?.type === 'error' ? 'bg-red-600' : 'bg-emerald-600'"
+       class="fixed top-4 right-4 z-50 px-4 py-2.5 rounded-lg shadow-xl text-white font-medium text-sm"
+       x-text="notification?.msg">
+  </div>
+
+  <div class="max-w-5xl mx-auto px-4 py-8">
+
+    <!-- Header -->
+    <div class="flex items-center justify-between mb-8">
+      <div>
+        <h1 class="text-2xl font-bold text-white tracking-tight">Chromecast Sender</h1>
+        <p class="text-slate-400 text-sm mt-0.5">
+          <span x-show="lastRefresh">Updated <span x-text="lastRefresh"></span></span>
+          <span x-show="!lastRefresh">Loading...</span>
+        </p>
+      </div>
+      <button @click="refreshStatuses()" :disabled="loadingStatus"
+              class="flex items-center gap-2 px-4 py-2 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded-lg text-sm font-medium transition-colors">
+        <svg :class="loadingStatus && 'animate-spin'" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+        </svg>
+        Refresh
+      </button>
+    </div>
+
+    <!-- Devices Section -->
+    <section class="mb-8">
+      <div class="flex items-center justify-between mb-4">
+        <h2 class="text-base font-semibold text-slate-200 uppercase tracking-wider text-xs">Devices</h2>
+        <div class="flex gap-2" x-show="config.devices.length > 0">
+          <button @click="castAll()"
+                  class="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 rounded-lg text-xs font-medium transition-colors">
+            Cast All
+          </button>
+          <button @click="stopAll()"
+                  class="px-3 py-1.5 bg-slate-600 hover:bg-slate-500 rounded-lg text-xs font-medium transition-colors">
+            Stop All
+          </button>
+        </div>
+      </div>
+
+      <div x-show="config.devices.length === 0"
+           class="text-slate-500 text-sm py-10 text-center border border-dashed border-slate-700 rounded-xl">
+        No devices configured yet — use the scanner below to find devices.
+      </div>
+
+      <div class="grid gap-4 sm:grid-cols-2">
+        <template x-for="(device, i) in config.devices" :key="i">
+          <div class="bg-slate-800 rounded-xl p-5 border border-slate-700">
+            <div class="flex items-start justify-between mb-4">
+              <div class="flex items-center gap-3">
+                <div class="w-2 h-2 rounded-full flex-shrink-0"
+                     :class="{
+                       'bg-emerald-400': statusFor(device.name)?.state?.toLowerCase() === 'playing',
+                       'bg-yellow-400 animate-pulse': statusFor(device.name)?.state?.toLowerCase() === 'buffering',
+                       'bg-slate-500': !statusFor(device.name) || ['unknown','idle'].includes(statusFor(device.name)?.state?.toLowerCase())
+                     }">
+                </div>
+                <div>
+                  <p class="font-medium text-white text-sm leading-tight" x-text="device.name"></p>
+                  <p class="text-slate-400 text-xs mt-0.5 capitalize"
+                     x-text="statusFor(device.name)?.state || 'unknown'">
+                  </p>
+                </div>
+              </div>
+              <label class="flex items-center gap-1.5 text-xs text-slate-400 cursor-pointer select-none">
+                <input type="checkbox" x-model="device.auto_cast" class="accent-blue-500" />
+                Auto-cast
+              </label>
+            </div>
+
+            <input type="text" x-model="device.host"
+                   placeholder="IP address (e.g. 192.168.1.5)"
+                   class="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-sm text-slate-200 placeholder-slate-500 mb-2 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500/50 transition" />
+            <input type="url" x-model="device.url"
+                   :placeholder="config.default_url || 'https://... (or uses default URL)'"
+                   class="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-sm text-slate-200 placeholder-slate-500 mb-3 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500/50 transition" />
+
+            <div class="flex gap-2">
+              <button @click="castDevice(device)"
+                      class="flex-1 px-3 py-2 bg-blue-600 hover:bg-blue-500 rounded-lg text-sm font-medium transition-colors">
+                Cast
+              </button>
+              <button @click="stopDevice(device)"
+                      class="flex-1 px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded-lg text-sm font-medium transition-colors">
+                Stop
+              </button>
+            </div>
+          </div>
+        </template>
+      </div>
+    </section>
+
+    <!-- Config Section -->
+    <section class="mb-8">
+      <div class="flex items-center justify-between mb-4">
+        <h2 class="text-base font-semibold text-slate-200 uppercase tracking-wider text-xs">Configuration</h2>
+        <button @click="saveConfig()" :disabled="saving"
+                class="px-4 py-1.5 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 rounded-lg text-sm font-medium transition-colors">
+          <span x-show="!saving">Save</span>
+          <span x-show="saving">Saving...</span>
+        </button>
+      </div>
+
+      <div class="bg-slate-800 rounded-xl p-5 border border-slate-700 space-y-5">
+        <div class="grid sm:grid-cols-2 gap-4">
+          <div>
+            <label class="block text-xs text-slate-400 mb-1.5 font-medium">Default URL</label>
+            <input type="url" x-model="config.default_url"
+                   placeholder="http://192.168.1.x/dashboard"
+                   class="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-sm text-slate-200 placeholder-slate-500 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500/50 transition" />
+            <p class="text-xs text-slate-500 mt-1">Used when a device has no URL set</p>
+          </div>
+          <div>
+            <label class="block text-xs text-slate-400 mb-1.5 font-medium">Check Interval (seconds)</label>
+            <input type="number" x-model.number="config.check_interval" min="10"
+                   class="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500/50 transition" />
+            <p class="text-xs text-slate-500 mt-1">How often to check idle devices</p>
+          </div>
+        </div>
+
+        <div>
+          <div class="flex items-center justify-between mb-2">
+            <label class="text-xs text-slate-400 font-medium">Device Names</label>
+            <button @click="addDeviceManually()"
+                    class="text-xs text-blue-400 hover:text-blue-300 transition-colors">+ Add manually</button>
+          </div>
+          <template x-for="(device, i) in config.devices" :key="i">
+            <div class="flex items-center gap-2 mb-2">
+              <input type="text" x-model="device.name" placeholder="Device name (must match exactly)"
+                     class="flex-1 bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-sm text-slate-200 placeholder-slate-500 focus:outline-none focus:border-blue-500 transition" />
+              <button @click="config.devices.splice(i, 1)"
+                      class="text-slate-500 hover:text-red-400 transition-colors px-2 text-xl leading-none">×</button>
+            </div>
+          </template>
+          <div x-show="config.devices.length === 0" class="text-slate-500 text-xs">No devices added yet.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Scanner Section -->
+    <section>
+      <div class="flex items-center justify-between mb-3">
+        <h2 class="text-base font-semibold text-slate-200 uppercase tracking-wider text-xs">Network Scanner</h2>
+        <button @click="scan()" :disabled="scanning"
+                class="flex items-center gap-2 px-4 py-1.5 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded-lg text-sm font-medium transition-colors">
+          <svg :class="scanning && 'animate-spin'" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8.111 16.404a5.5 5.5 0 017.778 0M12 20h.01m-7.08-7.071c3.904-3.905 10.236-3.905 14.141 0M1.394 9.393c5.857-5.857 15.355-5.857 21.213 0" />
+          </svg>
+          <span x-show="!scanning">Scan Network</span>
+          <span x-show="scanning">Scanning...</span>
+        </button>
+      </div>
+
+      <div class="flex items-center gap-3 mb-4">
+        <label for="subnet-input" class="text-xs text-slate-400 whitespace-nowrap">Subnet</label>
+        <input id="subnet-input"
+               type="text"
+               list="subnet-list"
+               x-model="scanSubnet"
+               :disabled="scanning"
+               placeholder="Auto-detect (or e.g. 192.168.1.0/24)"
+               class="flex-1 bg-slate-900 border border-slate-600 rounded-lg px-3 py-1.5 text-sm text-slate-200 placeholder-slate-500 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500/50 disabled:opacity-50 transition" />
+        <datalist id="subnet-list">
+          <template x-for="s in suggestedSubnets" :key="s">
+            <option :value="s"></option>
+          </template>
+        </datalist>
+        <button x-show="scanSubnet" @click="scanSubnet = ''"
+                class="text-slate-500 hover:text-slate-300 text-lg leading-none transition-colors">×</button>
+      </div>
+
+      <!-- Live diagnostics -->
+      <div x-show="scanStatus" class="mb-4 bg-slate-800 border border-slate-700 rounded-xl p-4 space-y-3">
+        <p class="text-slate-300 text-sm font-mono" x-text="scanStatus"></p>
+        <template x-if="scanProgress">
+          <div>
+            <div class="flex justify-between text-xs text-slate-500 mb-1.5">
+              <span x-text="scanProgress.checked + ' / ' + scanProgress.total + ' hosts checked'"></span>
+              <span x-text="Math.round(scanProgress.checked / scanProgress.total * 100) + '%'"></span>
+            </div>
+            <div class="w-full bg-slate-700 rounded-full h-1.5">
+              <div class="bg-blue-500 h-1.5 rounded-full transition-all duration-300"
+                   :style="'width:' + Math.round(scanProgress.checked / scanProgress.total * 100) + '%'"></div>
+            </div>
+          </div>
+        </template>
+      </div>
+
+      <div x-show="!scanStatus && !scanning && discoveredDevices.length === 0"
+           class="text-slate-500 text-sm py-10 text-center border border-dashed border-slate-700 rounded-xl">
+        Click "Scan Network" to discover Chromecast devices.
+      </div>
+
+      <div class="grid gap-3 sm:grid-cols-2">
+        <template x-for="device in discoveredDevices" :key="device.name">
+          <div class="bg-slate-800 rounded-xl p-4 border border-slate-700 flex items-center justify-between">
+            <div>
+              <p class="font-medium text-white text-sm" x-text="device.name"></p>
+              <p class="text-slate-400 text-xs mt-0.5" x-text="device.host"></p>
+            </div>
+            <button @click="addFromScan(device)"
+                    :disabled="isDeviceConfigured(device.name)"
+                    class="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 disabled:bg-slate-700 disabled:text-slate-400 rounded-lg text-xs font-medium transition-colors">
+              <span x-show="!isDeviceConfigured(device.name)">Add to Config</span>
+              <span x-show="isDeviceConfigured(device.name)">Added</span>
+            </button>
+          </div>
+        </template>
+      </div>
+    </section>
+
+  </div>
+
+  <script>
+    function app() {
+      return {
+        config: { check_interval: 60, default_url: '', devices: [] },
+        statuses: [],
+        discoveredDevices: [],
+        loadingStatus: false,
+        scanning: false,
+        saving: false,
+        notification: null,
+        lastRefresh: '',
+        scanStatus: '',
+        scanProgress: null,
+        scanSubnet: '',
+        suggestedSubnets: [],
+
+        async init() {
+          await this.loadConfig()
+          await this.refreshStatuses()
+          this.loadSubnets()
+          setInterval(() => this.refreshStatuses(), 30000)
+        },
+
+        async loadSubnets() {
+          try {
+            const res = await fetch('/api/subnets')
+            if (res.ok) this.suggestedSubnets = await res.json() || []
+          } catch {}
+        },
+
+        async loadConfig() {
+          try {
+            const res = await fetch('/api/config')
+            if (res.ok) {
+              this.config = await res.json()
+              if (!this.config.devices) this.config.devices = []
+            }
+          } catch (e) {
+            this.notify('Failed to load config: ' + e.message, 'error')
+          }
+        },
+
+        async saveConfig() {
+          this.saving = true
+          try {
+            const res = await fetch('/api/config', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(this.config),
+            })
+            if (!res.ok) throw new Error(await res.text())
+            this.notify('Config saved', 'success')
+          } catch (e) {
+            this.notify('Save failed: ' + e.message, 'error')
+          } finally {
+            this.saving = false
+          }
+        },
+
+        async refreshStatuses() {
+          if (this.loadingStatus) return
+          this.loadingStatus = true
+          try {
+            const res = await fetch('/api/devices/status')
+            if (res.ok) {
+              this.statuses = await res.json() || []
+              this.lastRefresh = new Date().toLocaleTimeString()
+            }
+          } catch {
+            // silent — network may be briefly unavailable
+          } finally {
+            this.loadingStatus = false
+          }
+        },
+
+        statusFor(name) {
+          return this.statuses.find(s => s.name === name)
+        },
+
+        scan() {
+          if (this.scanning) return
+          this.scanning = true
+          this.discoveredDevices = []
+          this.scanStatus = 'Starting...'
+          this.scanProgress = null
+
+          const url = this.scanSubnet
+            ? `/api/devices/scan?subnet=${encodeURIComponent(this.scanSubnet)}`
+            : '/api/devices/scan'
+          const es = new EventSource(url)
+
+          es.onmessage = (e) => {
+            const evt = JSON.parse(e.data)
+            switch (evt.type) {
+              case 'status':
+                this.scanStatus = evt.message
+                break
+              case 'progress':
+                this.scanProgress = { checked: evt.checked, total: evt.total }
+                break
+              case 'found':
+                this.discoveredDevices.push(evt.device)
+                break
+              case 'done':
+                this.scanning = false
+                this.scanProgress = null
+                this.scanStatus = evt.count === 0
+                  ? 'No devices found'
+                  : `Done — found ${evt.count} device${evt.count !== 1 ? 's' : ''}`
+                es.close()
+                if (evt.count === 0) this.notify('No Chromecast devices found', 'error')
+                break
+            }
+          }
+
+          es.onerror = () => {
+            es.close()
+            this.scanning = false
+            this.scanProgress = null
+            this.scanStatus = 'Scan failed'
+            this.notify('Scan failed', 'error')
+          }
+        },
+
+        isDeviceConfigured(name) {
+          return this.config.devices.some(d => d.name === name)
+        },
+
+        addFromScan(discovered) {
+          if (!this.isDeviceConfigured(discovered.name)) {
+            this.config.devices.push({ name: discovered.name, host: discovered.host, url: '', auto_cast: false })
+            this.notify(`Added "${discovered.name}" — save config to persist`, 'success')
+          }
+        },
+
+        addDeviceManually() {
+          this.config.devices.push({ name: '', url: '', auto_cast: false })
+        },
+
+        async castDevice(device) {
+          const url = device.url || this.config.default_url
+          if (!url) {
+            this.notify('No URL set for this device (and no default URL)', 'error')
+            return
+          }
+          try {
+            await fetch('/api/devices/cast', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ name: device.name, host: device.host || '', url }),
+            })
+            this.notify(`Casting to "${device.name}"`, 'success')
+            setTimeout(() => this.refreshStatuses(), 5000)
+          } catch (e) {
+            this.notify('Cast error: ' + e.message, 'error')
+          }
+        },
+
+        async stopDevice(device) {
+          try {
+            await fetch('/api/devices/stop', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ name: device.name, host: device.host || '' }),
+            })
+            this.notify(`Stopped "${device.name}"`, 'success')
+            setTimeout(() => this.refreshStatuses(), 3000)
+          } catch (e) {
+            this.notify('Stop error: ' + e.message, 'error')
+          }
+        },
+
+        async castAll() {
+          for (const device of this.config.devices) {
+            await this.castDevice(device)
+          }
+        },
+
+        async stopAll() {
+          for (const device of this.config.devices) {
+            await this.stopDevice(device)
+          }
+        },
+
+        notify(msg, type = 'success') {
+          this.notification = { msg, type }
+          setTimeout(() => this.notification = null, 3500)
+        },
+      }
+    }
+  </script>
+</body>
+</html>
