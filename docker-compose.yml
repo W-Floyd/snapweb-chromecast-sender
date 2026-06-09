@@ -1,6 +1,6 @@
 services:
   chromecast-sender:
-    build: .
+    image: ghcr.io/w-floyd/snapweb-chromecast-sender:main
     ports:
       - "8083:8083"
     volumes:
@@ -14,7 +14,7 @@ services:
   # to enable mDNS-based device scanning. network_mode: host is incompatible
   # with ports: mapping — the server is accessible directly on the host port.
   # chromecast-sender-linux:
-  #   build: .
+  #   image: ghcr.io/w-floyd/snapweb-chromecast-sender:main
   #   network_mode: host
   #   volumes:
   #     - ./config:/config
