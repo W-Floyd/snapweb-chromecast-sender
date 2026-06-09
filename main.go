@@ -101,6 +101,8 @@ func getDeviceStatus(dev DeviceConfig) DeviceStatus {
 		ds.Error = strings.TrimSpace(out)
 		return ds
 	}
+	// Default to Idle on a successful call — catt omits "State:" when nothing is casting.
+	ds.State = "Idle"
 	scanner := bufio.NewScanner(strings.NewReader(out))
 	for scanner.Scan() {
 		line := scanner.Text()
