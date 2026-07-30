@@ -47,7 +47,8 @@ Use **Scan Network** to discover devices, add them to config, set their IP in th
       "name": "Living Room",
       "host": "192.168.1.50",
       "url": "",
-      "auto_cast": true
+      "auto_cast": true,
+      "takeover": false
     }
   ]
 }
@@ -55,10 +56,11 @@ Use **Scan Network** to discover devices, add them to config, set their IP in th
 
 | Field | Description |
 |---|---|
-| `check_interval` | Seconds between idle checks (minimum 10) |
+| `check_interval` | Seconds between idle checks (clamped to 10–86400) |
 | `default_url` | Fallback URL for devices with no URL set |
 | `host` | Device IP — required in Docker (bypasses mDNS) |
 | `auto_cast` | Cast automatically when the device is idle |
+| `takeover` | Let auto-cast reclaim a device someone else is using (off by default) |
 
 ## Environment variables
 

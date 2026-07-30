@@ -30,6 +30,12 @@ func TestParseSubnet(t *testing.T) {
 		{"192.168.999", ""},
 		{"192.168.abc", ""},
 		{"fe80::1", ""},
+		// Atoi accepts these; Go's IP parser does not, so every address built
+		// from such a base fails to dial and the scan reports "No devices found"
+		// rather than "Invalid subnet".
+		{"192.168.01", ""},
+		{"192.168.+1", ""},
+		{"010.0.0", ""},
 	}
 	for _, c := range cases {
 		if got := parseSubnet(c.in); got != c.want {
@@ -80,6 +86,16 @@ func TestParseCattScan(t *testing.T) {
 
 	if got := parseCattScan("Scanning Chromecasts...\nNo devices found.\n"); len(got) != 0 {
 		t.Errorf("expected no devices, got %+v", got)
+	}
+
+	// mDNS answers arrive per interface, so a host that sees the LAN two ways can
+	// list the same device twice. The UI keys its list by host and Alpine throws
+	// on a duplicate key, dropping every discovered device rather than the repeat.
+	got = parseCattScan("192.168.1.5 - Lounge - Google Inc. Chromecast\n" +
+		"192.168.1.5 - Lounge - Google Inc. Chromecast\n" +
+		"Name: Lounge\nHost: 192.168.1.5\n")
+	if len(got) != 1 {
+		t.Errorf("duplicate hosts not collapsed: %+v", got)
 	}
 }
 
@@ -153,6 +169,18 @@ func TestNormalizeConfig(t *testing.T) {
 	normalizeConfig(&c)
 	if c.CheckInterval != minCheckInterval {
 		t.Errorf("interval 3 = %d, want floor %d", c.CheckInterval, minCheckInterval)
+	}
+
+	// Past ~9.2e9 seconds the monitor's `Duration(interval) * time.Second`
+	// overflows int64 and wraps negative, time.Sleep does not wait at all, and the
+	// loop re-probes and re-casts every device continuously.
+	c = Config{CheckInterval: 1 << 40}
+	normalizeConfig(&c)
+	if c.CheckInterval != maxCheckInterval {
+		t.Errorf("huge interval = %d, want ceiling %d", c.CheckInterval, maxCheckInterval)
+	}
+	if d := time.Duration(c.CheckInterval) * time.Second; d <= 0 {
+		t.Errorf("clamped interval still yields a non-positive sleep: %v", d)
 	}
 
 	c = Config{
@@ -473,6 +501,15 @@ func TestCattFailureAlwaysExplains(t *testing.T) {
 	if got := cattFailure(errors.New("exit status 1"), "\nDevice not found.\n"); got != "Device not found." {
 		t.Errorf("catt output should win, got %q", got)
 	}
+	// A traceback on the pipe is repeated in every /api/devices/status response
+	// for as long as the failure stands, and rendered into a one-line card.
+	got := cattFailure(errors.New("exit status 1"), strings.Repeat("é", maxCastErrLen*3))
+	if n := utf8.RuneCountInString(got); n != maxCastErrLen+1 {
+		t.Errorf("long catt output not bounded: %d runes", n)
+	}
+	if !utf8.ValidString(got) {
+		t.Errorf("bounded message is not valid UTF-8: %q", got)
+	}
 }
 
 func TestLocalSubnetsAreUnique(t *testing.T) {
@@ -518,13 +555,18 @@ func TestCollectSubnetsFiltersPublicEvenUnfiltered(t *testing.T) {
 }
 
 func TestIsVirtualIface(t *testing.T) {
-	virtual := []string{"docker0", "br-1a2b3c", "veth9f2", "virbr0", "utun3", "tailscale0"}
+	virtual := []string{
+		"docker0", "br-1a2b3c", "veth9f2", "virbr0", "utun3", "tailscale0",
+		"vboxnet0", "vmnet8", "lxcbr0", "lxdbr0", "podman0", "cali1a2b3c",
+	}
 	for _, n := range virtual {
 		if !isVirtualIface(n) {
 			t.Errorf("%q should be treated as virtual", n)
 		}
 	}
-	for _, n := range []string{"eth0", "en0", "wlan0", "enp3s0", "eno1"} {
+	// br0 is a real LAN bridge on libvirt/Proxmox hosts, so the filter has to stay
+	// narrower than a bare "br" prefix or it hides the only subnet that matters.
+	for _, n := range []string{"eth0", "en0", "wlan0", "enp3s0", "eno1", "br0", "bond0"} {
 		if isVirtualIface(n) {
 			t.Errorf("%q should not be treated as virtual", n)
 		}

@@ -159,7 +159,9 @@
           </div>
           <div>
             <label class="block text-xs text-slate-400 mb-1.5 font-medium">Check Interval (seconds)</label>
-            <input type="number" x-model.number="config.check_interval" min="10"
+            <!-- max matches the server's clamp: past ~9.2e9 seconds the
+                 monitor's sleep duration overflows and it stops sleeping. -->
+            <input type="number" x-model.number="config.check_interval" min="10" max="86400"
                    class="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500/50 transition" />
             <p class="text-xs text-slate-500 mt-1">How often to check idle devices</p>
           </div>
@@ -393,7 +395,12 @@
                 this.scanProgress = { checked: evt.checked, total: evt.total }
                 break
               case 'found':
-                this.discoveredDevices.push(evt.device)
+                // The list below is keyed by host, and Alpine throws on a
+                // missing or duplicate key — taking the whole rendered list
+                // down, not just the one bad row.
+                if (evt.device?.host && !this.discoveredDevices.some(d => d.host === evt.device.host)) {
+                  this.discoveredDevices.push(evt.device)
+                }
                 break
               case 'done':
                 this.scanning = false

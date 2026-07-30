@@ -23,6 +23,14 @@ import (
 // UI's min attribute.
 const minCheckInterval = 10
 
+// maxCheckInterval (a day) is the longest interval we honour. The ceiling is not
+// cosmetic: monitorLoop sleeps for `time.Duration(interval) * time.Second`, and
+// past ~9.2e9 seconds that multiplication overflows int64 and wraps negative.
+// time.Sleep returns immediately on a negative duration, so a fat-fingered paste
+// in the interval box turned the monitor into a hot loop that re-probed and
+// re-cast every device continuously.
+const maxCheckInterval = 86400
+
 type DeviceConfig struct {
 	Name     string `json:"name"`
 	Host     string `json:"host,omitempty"` // IP address; bypasses mDNS when set
@@ -208,13 +216,23 @@ func isCasting(dev DeviceConfig) bool {
 // full Python traceback, and all of it would end up in every status response.
 const maxCastErrLen = 400
 
-func setCastError(dev DeviceConfig, msg string) {
+// shortError trims and bounds a subprocess message on its way into a
+// DeviceStatus. Every error we report is repeated in every /api/devices/status
+// response for as long as it stands, so an unbounded one — a Python traceback
+// from a broken pychromecast install is the realistic case — is paid on every
+// poll and rendered into a card sized for one line.
+func shortError(msg string) string {
 	msg = strings.TrimSpace(msg)
 	// Slice by runes, not bytes: a byte-slice can cut a multi-byte character in
 	// half and produce invalid UTF-8 in the JSON response.
 	if r := []rune(msg); len(r) > maxCastErrLen {
 		msg = string(r[:maxCastErrLen]) + "…"
 	}
+	return msg
+}
+
+func setCastError(dev DeviceConfig, msg string) {
+	msg = shortError(msg)
 	k := deviceKey(dev)
 	castStatesMu.Lock()
 	castStates[k] = false
@@ -281,6 +299,9 @@ func normalizeConfig(c *Config) {
 	}
 	if c.CheckInterval < minCheckInterval {
 		c.CheckInterval = minCheckInterval
+	}
+	if c.CheckInterval > maxCheckInterval {
+		c.CheckInterval = maxCheckInterval
 	}
 	c.DefaultURL = strings.TrimSpace(c.DefaultURL)
 	// Device names must match what the Chromecast advertises exactly, so a
@@ -405,10 +426,10 @@ func runCatt(ctx context.Context, timeout time.Duration, args ...string) (string
 // subprocess killed by our timeout prints nothing at all), so falling back to
 // the exec error keeps us from reporting an empty explanation.
 func cattFailure(err error, out string) string {
-	if msg := strings.TrimSpace(out); msg != "" {
+	if msg := shortError(out); msg != "" {
 		return msg
 	}
-	return err.Error()
+	return shortError(err.Error())
 }
 
 // configWarning reports an advisory problem with how a device is configured.
@@ -446,7 +467,10 @@ func getLiveStatus(ctx context.Context, dev DeviceConfig) DeviceStatus {
 	// such row shares the deviceKey "name:", so their cast errors landed on each
 	// other. Say what is missing instead.
 	if dev.Name == "" && dev.Host == "" {
-		return DeviceStatus{State: "unknown", Error: "device has no name or IP address"}
+		// Name is empty by definition here, but set it anyway: the UI pairs a
+		// status with its device by index *and* name, so every row it renders has
+		// to carry the field.
+		return DeviceStatus{Name: dev.Name, State: "unknown", Error: "device has no name or IP address"}
 	}
 	if dev.Host != "" {
 		return getPychromecastStatus(ctx, dev)
@@ -508,41 +532,59 @@ func getPychromecastStatus(ctx context.Context, dev DeviceConfig) DeviceStatus {
 		// Report the most useful diagnostic available. Previously a missing
 		// python3 or an empty stdout produced an empty Error, leaving the UI
 		// with no explanation at all.
+		errMsg, outMsg := shortError(stderr.String()), shortError(stdout.String())
 		switch {
-		case strings.TrimSpace(stderr.String()) != "":
-			ds.Error = strings.TrimSpace(stderr.String())
-		case strings.TrimSpace(stdout.String()) != "":
-			ds.Error = strings.TrimSpace(stdout.String())
+		case errMsg != "":
+			ds.Error = errMsg
+		case outMsg != "":
+			ds.Error = outMsg
 		case runErr != nil:
-			ds.Error = runErr.Error()
+			ds.Error = shortError(runErr.Error())
 		default:
 			ds.Error = "no status output from " + statusScript
 		}
 		return ds
 	}
 	if result.Error != "" {
-		ds.Error = result.Error
+		ds.Error = shortError(result.Error)
 		return ds
 	}
-	if result.IsIdle {
-		ds.State = "Idle"
-		observeCastState(dev, false, "", observedAt)
-	} else {
-		ds.State = result.DisplayName
-		if ds.State == "" {
-			ds.State = "Playing"
-		}
-		// After observing, so a poll that has just taught us the app id does not
-		// then report that same app as somebody else's. And only when the
-		// observation was actually applied: a probe that started before our cast
-		// landed is reporting the app that was running *beforehand*, and calling
-		// that foreign made the monitor "take back" a device already showing our
-		// dashboard — a second, wasted cast, which is the very thing the
-		// staleness check exists to prevent.
-		if observeCastState(dev, true, result.AppID, observedAt) {
-			ds.Foreign = isForeignApp(result.AppID)
-		}
+
+	playing := !result.IsIdle
+	// Only an app that is actually running can be ours. An idle device may still
+	// name one — Backdrop counts as idle — and offering it to the learner would
+	// teach the screensaver as our dashboard.
+	appID := ""
+	if playing {
+		appID = result.AppID
 	}
+	// Observe before reporting, so a poll that has just taught us the app id does
+	// not then turn round and report that same app as somebody else's.
+	if !observeCastState(dev, playing, appID, observedAt) {
+		// This probe began before a cast or stop of ours landed, so everything it
+		// describes — the state, the app name, the app id — is the device as it
+		// was beforehand; observeCastState dropped it for exactly that reason.
+		// Report the state we recorded instead, which is the newer of the two.
+		// Passing the stale view through made a device we had just cast to read
+		// "Idle" (or carry the previous app's name) on the card, and calling its
+		// app foreign made the monitor "take back" a device already showing our
+		// dashboard — a second, wasted cast.
+		if isCasting(dev) {
+			ds.State = "Playing"
+		} else {
+			ds.State = "Idle"
+		}
+		return ds
+	}
+	if !playing {
+		ds.State = "Idle"
+		return ds
+	}
+	ds.State = result.DisplayName
+	if ds.State == "" {
+		ds.State = "Playing"
+	}
+	ds.Foreign = isForeignApp(result.AppID)
 	return ds
 }
 
@@ -619,10 +661,16 @@ func monitorLoop() {
 		cfgMu.RLock()
 		interval := cfg.CheckInterval
 		cfgMu.RUnlock()
-		// Defensive floor: normalizeConfig already guarantees this, but a hot
-		// loop here would hammer every device with status queries.
+		// Defensive clamp: normalizeConfig already guarantees both bounds, but
+		// this is where the value becomes a Duration, and both ends of the range
+		// produce a hot loop that hammers every device with status queries — too
+		// small directly, too large by overflowing the multiplication below into a
+		// negative duration that time.Sleep does not wait on at all.
 		if interval < minCheckInterval {
 			interval = minCheckInterval
+		}
+		if interval > maxCheckInterval {
+			interval = maxCheckInterval
 		}
 		time.Sleep(time.Duration(interval) * time.Second)
 	}
@@ -689,6 +737,19 @@ func cattScan(ctx context.Context) []DiscoveredDevice {
 func parseCattScan(out string) []DiscoveredDevice {
 	var devices []DiscoveredDevice
 	var cur DiscoveredDevice
+	// One entry per host. mDNS answers arrive per interface, so a host that can
+	// see the LAN two ways (network_mode: host on a machine with wifi and
+	// ethernet up) gets listed twice — and the UI's device list is keyed by host,
+	// where a duplicate key makes Alpine throw and drop the whole list of
+	// discovered devices rather than just the repeat.
+	seen := map[string]bool{}
+	add := func(d DiscoveredDevice) {
+		if seen[d.Host] {
+			return
+		}
+		seen[d.Host] = true
+		devices = append(devices, d)
+	}
 	scanner := bufio.NewScanner(strings.NewReader(out))
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -698,7 +759,7 @@ func parseCattScan(out string) []DiscoveredDevice {
 		if after, ok := strings.CutPrefix(line, "Name:"); ok {
 			cur.Name = strings.TrimSpace(after)
 			if cur.Name != "" && cur.Host != "" {
-				devices = append(devices, cur)
+				add(cur)
 				cur = DiscoveredDevice{}
 			}
 			continue
@@ -706,7 +767,7 @@ func parseCattScan(out string) []DiscoveredDevice {
 		if after, ok := strings.CutPrefix(line, "Host:"); ok {
 			cur.Host = strings.TrimSpace(after)
 			if cur.Name != "" && cur.Host != "" {
-				devices = append(devices, cur)
+				add(cur)
 				cur = DiscoveredDevice{}
 			}
 			continue
@@ -728,7 +789,7 @@ func parseCattScan(out string) []DiscoveredDevice {
 			name = rest[:i] // trailing " - <manufacturer> <model>"
 		}
 		if name = strings.TrimSpace(name); name != "" {
-			devices = append(devices, DiscoveredDevice{Name: name, Host: strings.TrimSpace(host)})
+			add(DiscoveredDevice{Name: name, Host: strings.TrimSpace(host)})
 		}
 	}
 	return devices
@@ -739,9 +800,14 @@ func parseCattScan(out string) []DiscoveredDevice {
 // running Docker has one bridge per compose network, and including them turned
 // an auto-detect scan into ~2800 pointless probes across eleven subnets
 // instead of 254 across the one LAN the user actually cares about.
+//
+// "br-" and "lxcbr"/"lxdbr" rather than a bare "br": a Linux host really can
+// have its LAN on br0 (libvirt, Proxmox), and filtering that out would hide the
+// only subnet that matters.
 var virtualIfacePrefixes = []string{
 	"docker", "br-", "veth", "virbr", "cni", "flannel", "tailscale",
 	"tun", "tap", "utun", "zt", "wg",
+	"vboxnet", "vmnet", "lxcbr", "lxdbr", "podman", "cali",
 }
 
 func isVirtualIface(name string) bool {
@@ -872,12 +938,25 @@ func parseSubnet(s string) string {
 				return ""
 			}
 		}
-		return strings.Join(parts, ".")
+		base := strings.Join(parts, ".")
+		// Atoi is more permissive than Go's IP parser: it accepts a leading zero
+		// ("192.168.01") and a sign ("192.168.+1"). Those got through as a base
+		// that no host address built from it can be dialled, so the scan probed
+		// all 254 addresses, failed every one instantly, and reported "No devices
+		// found" instead of "Invalid subnet". Make the base prove itself.
+		if net.ParseIP(base+".1") == nil {
+			return ""
+		}
+		return base
 	}
 	return ""
 }
 
 func handleSubnets(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	bases := localSubnets()
 	cidrs := make([]string, len(bases)) // non-nil, so it marshals as [] not null
@@ -1008,6 +1087,13 @@ func tcpScan(ctx context.Context, subnets []string, onStatus func(string), onFou
 }
 
 func handleScan(w http.ResponseWriter, r *http.Request) {
+	// EventSource only ever issues a GET, and this endpoint probes every host on
+	// a /24 — reject anything else rather than let an unrelated request method
+	// kick off a network-wide scan.
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming not supported", http.StatusInternalServerError)
