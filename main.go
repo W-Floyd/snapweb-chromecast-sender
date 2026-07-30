@@ -28,6 +28,10 @@ type DeviceConfig struct {
 	Host     string `json:"host,omitempty"` // IP address; bypasses mDNS when set
 	URL      string `json:"url"`
 	AutoCast bool   `json:"auto_cast"`
+	// Takeover lets auto-cast reclaim a device that someone else is using.
+	// Off by default: the whole point of noticing a foreign app is to not yank
+	// the TV out from under whoever is watching it.
+	Takeover bool `json:"takeover"`
 }
 
 type Config struct {
@@ -41,6 +45,10 @@ type DeviceStatus struct {
 	State string `json:"state"`
 	URL   string `json:"url,omitempty"`
 	Error string `json:"error,omitempty"`
+	// Foreign marks a device playing an app that is not our cast — someone
+	// started something on it. False whenever we cannot tell (see
+	// learnedCastApp), so the UI never accuses anyone on a guess.
+	Foreign bool `json:"foreign,omitempty"`
 }
 
 type DiscoveredDevice struct {
@@ -62,8 +70,30 @@ var (
 	// deviceKey. /api/devices/cast answers before catt has run, so without this
 	// a failed cast looks identical to a successful one in the UI — the device
 	// just quietly stays idle and the reason is only ever in the server log.
-	castErrors   = map[string]string{}
-	castStatesMu sync.RWMutex
+	castErrors = map[string]string{}
+	// castActions records when we last *acted* on a device (a cast or stop we
+	// initiated), keyed by deviceKey. A status probe takes seconds, so a probe
+	// that started before the cast can return after it and report the device as
+	// still idle — last-writer-wins then erased the fresh state, the monitor
+	// re-cast a device that was already playing, and a fresh cast error was
+	// cleared by an observation older than the failure. Observations older than
+	// the last action are stale by definition and get dropped.
+	castActions = map[string]time.Time{}
+	// learnedCastApp is the receiver app id our own casts run under (catt's
+	// cast_site uses DashCast). It is learned from the first status poll after a
+	// cast we initiated rather than hardcoded: a wrong constant here would make
+	// the monitor read its own dashboard as someone else's app and re-cast it on
+	// every single tick. Empty until learned, and an unknown app is never
+	// reported as foreign — being wrong in that direction only costs us a
+	// takeover we could have done, not a dashboard that restarts forever.
+	//
+	// One value for all devices, not one per device: it is a property of catt,
+	// so the first auto-cast after a restart re-learns it for the whole fleet.
+	learnedCastApp string
+	// castLearnPending marks devices we have just cast to and whose next
+	// non-idle poll therefore identifies that app.
+	castLearnPending = map[string]bool{}
+	castStatesMu     sync.RWMutex
 
 	// scanInFlight serialises /api/devices/scan. A TCP scan fans out to every
 	// host on the subnet; letting impatient re-clicks stack them up multiplies
@@ -87,7 +117,14 @@ func setCastState(dev DeviceConfig, playing bool) {
 	k := deviceKey(dev)
 	castStatesMu.Lock()
 	castStates[k] = playing
+	castActions[k] = time.Now()
 	delete(castErrors, k)
+	if playing {
+		// Whatever the next poll finds running is what our cast runs as.
+		castLearnPending[k] = true
+	} else {
+		delete(castLearnPending, k)
+	}
 	castStatesMu.Unlock()
 }
 
@@ -97,14 +134,36 @@ func setCastState(dev DeviceConfig, playing bool) {
 // failed cast, and clearing the error there erased it before
 // getDeviceStatus could merge it in — every failure read as a plain "Idle".
 // An observed *playing* device does mean the last error is stale, so drop it.
-func observeCastState(dev DeviceConfig, playing bool) {
+//
+// observedAt is when the poll *began*, not when it finished: a probe takes
+// seconds, so one started before a cast can land after it and would otherwise
+// overwrite the newer truth with what it saw beforehand.
+func observeCastState(dev DeviceConfig, playing bool, appID string, observedAt time.Time) {
 	k := deviceKey(dev)
 	castStatesMu.Lock()
+	defer castStatesMu.Unlock()
+	if acted, ok := castActions[k]; ok && observedAt.Before(acted) {
+		return // this poll predates the cast/stop it would be overwriting
+	}
+	if playing && appID != "" && castLearnPending[k] {
+		// Overwrite rather than keep the first value ever seen: if someone cast
+		// to the device in the gap between our cast and this poll we learn the
+		// wrong app, and only a later cast can correct it.
+		learnedCastApp = appID
+		delete(castLearnPending, k)
+	}
 	castStates[k] = playing
 	if playing {
 		delete(castErrors, k)
 	}
-	castStatesMu.Unlock()
+}
+
+// isForeignApp reports whether appID is something other than our own cast.
+// Unknown on either side means "cannot tell", which is deliberately not foreign.
+func isForeignApp(appID string) bool {
+	castStatesMu.RLock()
+	defer castStatesMu.RUnlock()
+	return learnedCastApp != "" && appID != "" && appID != learnedCastApp
 }
 
 func isCasting(dev DeviceConfig) bool {
@@ -128,6 +187,9 @@ func setCastError(dev DeviceConfig, msg string) {
 	castStatesMu.Lock()
 	castStates[k] = false
 	castErrors[k] = msg
+	// A failure is an action too: without this an in-flight poll that saw the
+	// device playing could land afterwards and delete the error we just recorded.
+	castActions[k] = time.Now()
 	castStatesMu.Unlock()
 }
 
@@ -153,6 +215,16 @@ func pruneCastStates(devices []DeviceConfig) {
 	for k := range castErrors {
 		if !keep[k] {
 			delete(castErrors, k)
+		}
+	}
+	for k := range castActions {
+		if !keep[k] {
+			delete(castActions, k)
+		}
+	}
+	for k := range castLearnPending {
+		if !keep[k] {
+			delete(castLearnPending, k)
 		}
 	}
 	castStatesMu.Unlock()
@@ -336,9 +408,13 @@ func getPychromecastStatus(ctx context.Context, dev DeviceConfig) DeviceStatus {
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
+	// Stamp before running: what this reports is true as of now, not as of
+	// whenever the subprocess happens to finish up to 15s later.
+	observedAt := time.Now()
 	runErr := cmd.Run()
 
 	var result struct {
+		AppID       string `json:"app_id"`
 		DisplayName string `json:"display_name"`
 		IsIdle      bool   `json:"is_idle"`
 		Error       string `json:"error"`
@@ -365,13 +441,16 @@ func getPychromecastStatus(ctx context.Context, dev DeviceConfig) DeviceStatus {
 	}
 	if result.IsIdle {
 		ds.State = "Idle"
-		observeCastState(dev, false)
+		observeCastState(dev, false, "", observedAt)
 	} else {
 		ds.State = result.DisplayName
 		if ds.State == "" {
 			ds.State = "Playing"
 		}
-		observeCastState(dev, true)
+		observeCastState(dev, true, result.AppID, observedAt)
+		// After observing, so a poll that has just taught us the app id does not
+		// then report that same app as somebody else's.
+		ds.Foreign = isForeignApp(result.AppID)
 	}
 	return ds
 }
@@ -397,19 +476,36 @@ func monitorDevices(ctx context.Context) {
 		// alone means a device that drops the cast (reboot, someone else casts
 		// to it) is never recovered, because nothing clears the flag unless a
 		// browser happens to be polling /api/devices/status.
+		// foreign stays false for a device with no host IP: the catt-only status
+		// path cannot report an app id, so we can never tell, and the safe answer
+		// is to behave exactly as before.
+		foreign := false
 		if dev.Host != "" {
 			// A probe error means the device is off or unreachable, so a cast
 			// cannot succeed. Skipping it matters: catt would spend its full 30s
 			// timeout failing, serially, and a couple of powered-off TVs were
 			// enough to keep the loop permanently busy and starve the devices
 			// that were actually up.
-			if st := getPychromecastStatus(ctx, dev); st.Error != "" {
+			st := getPychromecastStatus(ctx, dev)
+			if st.Error != "" {
 				log.Printf("skipping auto-cast to %q: %s", dev.Name, st.Error)
 				continue
 			}
+			foreign = st.Foreign
+			if foreign && !dev.Takeover {
+				// Somebody is watching something. Leave it alone — enable
+				// takeover on the device to reclaim it instead.
+				continue
+			}
 		}
-		if isCasting(dev) {
+		// A foreign app sets the cast state too (isCasting means "playing
+		// something", not "playing ours"), so it must not short-circuit a
+		// takeover that the check above has already approved.
+		if isCasting(dev) && !foreign {
 			continue
+		}
+		if foreign {
+			log.Printf("taking %q back from another app", dev.Name)
 		}
 		log.Printf("auto-casting to %q: %s", dev.Name, url)
 		args := append(cattDeviceArgs(dev), "cast_site", url)
@@ -490,13 +586,20 @@ func parseCattScan(out string) []DiscoveredDevice {
 	scanner := bufio.NewScanner(strings.NewReader(out))
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
+		// Emit on whichever of the pair completes the device. Keying the append
+		// off "Host:" alone assumed Name always came first; the reverse order
+		// left the pair sitting in cur and the device was never reported.
 		if after, ok := strings.CutPrefix(line, "Name:"); ok {
 			cur.Name = strings.TrimSpace(after)
+			if cur.Name != "" && cur.Host != "" {
+				devices = append(devices, cur)
+				cur = DiscoveredDevice{}
+			}
 			continue
 		}
 		if after, ok := strings.CutPrefix(line, "Host:"); ok {
 			cur.Host = strings.TrimSpace(after)
-			if cur.Name != "" {
+			if cur.Name != "" && cur.Host != "" {
 				devices = append(devices, cur)
 				cur = DiscoveredDevice{}
 			}
@@ -872,6 +975,13 @@ func handleCast(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	// Trim like normalizeConfig does. deviceKey is built from these, so an
+	// untrimmed name from the UI's unsaved edits filed the cast error under a
+	// key nothing else ever reads — the failure never reached the device card,
+	// and pruneCastStates never collected it.
+	req.Name = strings.TrimSpace(req.Name)
+	req.Host = strings.TrimSpace(req.Host)
+	req.URL = strings.TrimSpace(req.URL)
 	if req.Name == "" || req.URL == "" {
 		http.Error(w, "name and url required", http.StatusBadRequest)
 		return
@@ -908,6 +1018,8 @@ func handleStop(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	req.Name = strings.TrimSpace(req.Name)
+	req.Host = strings.TrimSpace(req.Host)
 	if req.Name == "" {
 		http.Error(w, "name required", http.StatusBadRequest)
 		return

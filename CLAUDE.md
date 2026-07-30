@@ -96,6 +96,20 @@ IP when available, name otherwise — because friendly names are *not* unique an
 leaks between devices otherwise. It's lost on restart (devices get re-cast on the next
 tick) and pruned on config save. Never key new state by name alone.
 
+`isCasting` means "playing *something*", not "playing ours" — a person casting
+Netflix sets it too. Telling the two apart needs the `app_id` the status helper
+reports, and `learnedCastApp` picks that up from the first poll after a cast we
+initiated rather than hardcoding DashCast's id. Don't be tempted to hardcode it:
+if the constant is wrong the monitor reads its own dashboard as a foreign app and
+re-casts it on every tick, so an app we cannot place deliberately reports *not*
+foreign. A device's `takeover` flag is what then lets auto-cast reclaim it.
+
+A status poll takes seconds, so one that started before a cast can land after it.
+`castActions` timestamps our own casts and `observeCastState` drops any
+observation older than that — without it the poll's stale view overwrote the
+newer truth, which both erased fresh cast errors and re-cast devices that were
+already playing.
+
 **A cast is reported before it happens.** `/api/devices/cast` and `/stop` answer
 immediately and run `catt` in a goroutine, so failures can't ride on the HTTP response.
 They land in `castErrors` and get merged into the next `/api/devices/status` payload.

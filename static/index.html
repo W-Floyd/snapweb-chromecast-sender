@@ -77,6 +77,13 @@
                   <p class="text-slate-400 text-xs mt-0.5 capitalize"
                      x-text="statusFor(device, i)?.state || 'unknown'">
                   </p>
+                  <!-- The state line above already names the app; this says whose
+                       it is, which is the part that decides whether auto-cast
+                       will leave the device alone. -->
+                  <p x-show="statusFor(device, i)?.foreign"
+                     class="text-amber-400 text-xs mt-0.5"
+                     x-text="device.takeover ? 'In use by another app — will take over' : 'In use by another app — leaving it alone'">
+                  </p>
                   <p x-show="statusFor(device, i)?.error"
                      class="text-red-400 text-xs mt-1 break-all line-clamp-3"
                      :title="statusFor(device, i)?.error"
@@ -84,10 +91,21 @@
                   </p>
                 </div>
               </div>
-              <label class="flex items-center gap-1.5 text-xs text-slate-400 cursor-pointer select-none">
-                <input type="checkbox" x-model="device.auto_cast" class="accent-blue-500" />
-                Auto-cast
-              </label>
+              <div class="flex flex-col items-end gap-1 flex-shrink-0">
+                <label class="flex items-center gap-1.5 text-xs text-slate-400 cursor-pointer select-none">
+                  <input type="checkbox" x-model="device.auto_cast" class="accent-blue-500" />
+                  Auto-cast
+                </label>
+                <!-- Only meaningful with auto-cast on; dimmed rather than hidden
+                     so the setting does not appear and vanish as the box is
+                     toggled. -->
+                <label class="flex items-center gap-1.5 text-xs cursor-pointer select-none transition-opacity"
+                       :class="device.auto_cast ? 'text-slate-400' : 'text-slate-600'"
+                       title="Re-cast even when someone else is using the device">
+                  <input type="checkbox" x-model="device.takeover" :disabled="!device.auto_cast" class="accent-amber-500" />
+                  Take over
+                </label>
+              </div>
             </div>
 
             <input type="text" x-model="device.host"
@@ -223,11 +241,11 @@
               <p class="text-slate-400 text-xs mt-0.5" x-text="device.host"></p>
             </div>
             <button @click="addFromScan(device)"
-                    :disabled="scanAddState(device.name) === 'added'"
+                    :disabled="scanAddState(device) === 'added'"
                     class="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 disabled:bg-slate-700 disabled:text-slate-400 rounded-lg text-xs font-medium transition-colors">
-              <span x-show="scanAddState(device.name) === 'add'">Add to Config</span>
-              <span x-show="scanAddState(device.name) === 'set-ip'">Set IP</span>
-              <span x-show="scanAddState(device.name) === 'added'">Added</span>
+              <span x-show="scanAddState(device) === 'add'">Add to Config</span>
+              <span x-show="scanAddState(device) === 'set-ip'">Set IP</span>
+              <span x-show="scanAddState(device) === 'added'">Added</span>
             </button>
           </div>
         </template>
@@ -395,14 +413,24 @@
           }
         },
 
-        scanAddState(name) {
-          const existing = this.config.devices.find(d => d.name === name)
+        // Match on the IP first, falling back to the name only for a config
+        // entry that has no IP yet. Two Chromecasts can share a friendly name,
+        // and matching on name alone made the second one resolve to the first:
+        // its button read "Added" and clicking it did nothing, so the device
+        // could not be added at all.
+        matchConfigured(discovered) {
+          return this.config.devices.find(d => d.host && d.host === discovered.host)
+            || this.config.devices.find(d => !d.host && d.name === discovered.name)
+        },
+
+        scanAddState(discovered) {
+          const existing = this.matchConfigured(discovered)
           if (!existing) return 'add'
           return existing.host ? 'added' : 'set-ip'
         },
 
         addFromScan(discovered) {
-          const existing = this.config.devices.find(d => d.name === discovered.name)
+          const existing = this.matchConfigured(discovered)
           if (existing) {
             // Already configured but with no IP (e.g. added manually) — fill it
             // in rather than silently doing nothing.
@@ -412,12 +440,12 @@
             }
             return
           }
-          this.config.devices.push({ name: discovered.name, host: discovered.host, url: '', auto_cast: false })
+          this.config.devices.push({ name: discovered.name, host: discovered.host, url: '', auto_cast: false, takeover: false })
           this.notify(`Added "${discovered.name}" — save config to persist`, 'success')
         },
 
         addDeviceManually() {
-          this.config.devices.push({ name: '', host: '', url: '', auto_cast: false })
+          this.config.devices.push({ name: '', host: '', url: '', auto_cast: false, takeover: false })
         },
 
         // notifyResult: skip per-device toasts during Cast All / Stop All so the

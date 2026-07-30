@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 )
 
@@ -58,6 +59,13 @@ func TestParseCattScan(t *testing.T) {
 	got = parseCattScan("Name: Bathroom\nHost: 192.168.1.134\nsome - unrelated - text\n")
 	if len(got) != 1 || got[0] != (DiscoveredDevice{Name: "Bathroom", Host: "192.168.1.134"}) {
 		t.Errorf("labelled parse = %+v", got)
+	}
+
+	// ...in either field order. Emitting only on "Host:" dropped the device
+	// entirely when the host line came first.
+	got = parseCattScan("Host: 192.168.1.134\nName: Bathroom\n")
+	if len(got) != 1 || got[0] != (DiscoveredDevice{Name: "Bathroom", Host: "192.168.1.134"}) {
+		t.Errorf("host-first labelled parse = %+v", got)
 	}
 
 	if got := parseCattScan("Scanning Chromecasts...\nNo devices found.\n"); len(got) != 0 {
@@ -158,9 +166,7 @@ func TestNormalizeConfig(t *testing.T) {
 }
 
 func TestCastStateKeyedByHost(t *testing.T) {
-	castStatesMu.Lock()
-	castStates = map[string]bool{}
-	castStatesMu.Unlock()
+	resetCastState()
 
 	// Two devices sharing a friendly name must not share cast state.
 	a := DeviceConfig{Name: "Speaker", Host: "1.2.3.4"}
@@ -187,9 +193,7 @@ func TestCastStateKeyedByHost(t *testing.T) {
 }
 
 func TestCastErrorRecordedAndCleared(t *testing.T) {
-	castStatesMu.Lock()
-	castStates, castErrors = map[string]bool{}, map[string]string{}
-	castStatesMu.Unlock()
+	resetCastState()
 
 	dev := DeviceConfig{Name: "Kitchen", Host: "1.2.3.4"}
 	setCastError(dev, "  Chromecast not found  ")
@@ -217,17 +221,24 @@ func TestCastErrorRecordedAndCleared(t *testing.T) {
 	}
 }
 
-func TestObserveCastStateKeepsErrorWhileIdle(t *testing.T) {
+func resetCastState() {
 	castStatesMu.Lock()
 	castStates, castErrors = map[string]bool{}, map[string]string{}
+	castActions = map[string]time.Time{}
+	castLearnPending = map[string]bool{}
+	learnedCastApp = ""
 	castStatesMu.Unlock()
+}
+
+func TestObserveCastStateKeepsErrorWhileIdle(t *testing.T) {
+	resetCastState()
 
 	dev := DeviceConfig{Name: "Kitchen", Host: "1.2.3.4"}
 	setCastError(dev, "Chromecast not found")
 
 	// A status poll seeing the device idle is the consequence of that failure,
 	// not new information — it must not erase the reason.
-	observeCastState(dev, false)
+	observeCastState(dev, false, "", time.Now())
 	if got := castError(dev); got != "Chromecast not found" {
 		t.Errorf("idle observation cleared the cast error: %q", got)
 	}
@@ -236,12 +247,94 @@ func TestObserveCastStateKeepsErrorWhileIdle(t *testing.T) {
 	}
 
 	// Seeing it play means the error is stale.
-	observeCastState(dev, true)
+	observeCastState(dev, true, "", time.Now())
 	if got := castError(dev); got != "" {
 		t.Errorf("playing observation left a stale error: %q", got)
 	}
 	if !isCasting(dev) {
 		t.Error("device observed playing should be marked casting")
+	}
+}
+
+// A status probe takes seconds, so one that started before a cast/stop can
+// finish after it. Applying what it saw beforehand would undo the newer truth:
+// the monitor then re-casts a device that is already playing, and a just-recorded
+// cast error is wiped by an observation that predates the failure.
+func TestStaleObservationDoesNotOverwriteNewerAction(t *testing.T) {
+	dev := DeviceConfig{Name: "Kitchen", Host: "1.2.3.4"}
+
+	resetCastState()
+	probeStarted := time.Now().Add(-time.Second)
+	setCastState(dev, true) // cast completes while the probe is still running
+	observeCastState(dev, false, "", probeStarted)
+	if !isCasting(dev) {
+		t.Error("stale idle observation overwrote a newer successful cast")
+	}
+
+	resetCastState()
+	probeStarted = time.Now().Add(-time.Second)
+	setCastError(dev, "Chromecast not found")
+	observeCastState(dev, true, "", probeStarted)
+	if got := castError(dev); got != "Chromecast not found" {
+		t.Errorf("stale playing observation erased a newer cast error: %q", got)
+	}
+	if isCasting(dev) {
+		t.Error("stale playing observation overwrote a newer failure")
+	}
+
+	// A probe that *starts* after the action is current, and must still be able
+	// to notice that the device dropped the cast on its own.
+	resetCastState()
+	setCastState(dev, true)
+	observeCastState(dev, false, "", time.Now())
+	if isCasting(dev) {
+		t.Error("a fresh observation should be applied")
+	}
+}
+
+// The app id our casts run under is learned from the first poll after a cast we
+// initiated. Hardcoding it would be worse than not knowing: a wrong constant
+// makes the monitor read its own dashboard as a foreign app and re-cast it every
+// tick, so "cannot tell" must never report foreign.
+func TestForeignAppDetection(t *testing.T) {
+	dev := DeviceConfig{Name: "Lounge", Host: "1.2.3.4"}
+
+	resetCastState()
+	// Nothing learned yet: no app may be called foreign, however unfamiliar.
+	if isForeignApp("CA5E9605") {
+		t.Error("an unlearned app must not be reported as foreign")
+	}
+
+	setCastState(dev, true)
+	observeCastState(dev, true, "84912283", time.Now()) // first poll after our cast
+	if isForeignApp("84912283") {
+		t.Error("our own cast app reported as foreign")
+	}
+	if !isForeignApp("CA5E9605") {
+		t.Error("a different app should be reported as foreign")
+	}
+	// An empty app id is "cannot tell", not "someone else".
+	if isForeignApp("") {
+		t.Error("an empty app id must not be reported as foreign")
+	}
+
+	// Only the first poll after a cast teaches us; later polls of whatever
+	// someone else started must not redefine what our own cast looks like.
+	observeCastState(dev, true, "CA5E9605", time.Now())
+	if !isForeignApp("CA5E9605") {
+		t.Error("a later foreign observation overwrote the learned cast app")
+	}
+}
+
+func TestPruneCastStatesDropsActions(t *testing.T) {
+	resetCastState()
+	setCastState(DeviceConfig{Name: "Gone", Host: "1.2.3.4"}, true)
+	pruneCastStates(nil)
+	castStatesMu.RLock()
+	n := len(castActions)
+	castStatesMu.RUnlock()
+	if n != 0 {
+		t.Errorf("castActions has %d stale entries after prune", n)
 	}
 }
 

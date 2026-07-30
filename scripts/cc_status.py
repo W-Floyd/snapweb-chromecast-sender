@@ -93,7 +93,10 @@ def main():
 
         app_id = s.app_id
         display_name = (s.display_name or "").strip()
-        is_idle = bool(s.is_stand_by) or app_id is None or app_id == BACKDROP_APP_ID
+        # Treat an empty app_id like a missing one: some devices report "" rather
+        # than None when nothing is running, and `app_id is None` alone let that
+        # read as playing — the monitor then never re-cast the dashboard.
+        is_idle = bool(s.is_stand_by) or not app_id or app_id == BACKDROP_APP_ID
 
         # volume_level/volume_muted are None until the first status update lands.
         volume_level = round(s.volume_level, 2) if s.volume_level is not None else None
