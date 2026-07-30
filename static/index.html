@@ -70,17 +70,17 @@
                        'bg-emerald-400': s && s !== 'buffering' && !['idle','unknown',''].includes(s),
                        'bg-yellow-400 animate-pulse': s === 'buffering',
                        'bg-slate-500': !s || ['idle','unknown',''].includes(s),
-                     }))(statusFor(device.name)?.state?.toLowerCase())">
+                     }))(statusFor(device, i)?.state?.toLowerCase())">
                 </div>
                 <div>
                   <p class="font-medium text-white text-sm leading-tight" x-text="device.name"></p>
                   <p class="text-slate-400 text-xs mt-0.5 capitalize"
-                     x-text="statusFor(device.name)?.state || 'unknown'">
+                     x-text="statusFor(device, i)?.state || 'unknown'">
                   </p>
-                  <p x-show="statusFor(device.name)?.error"
+                  <p x-show="statusFor(device, i)?.error"
                      class="text-red-400 text-xs mt-1 break-all line-clamp-3"
-                     :title="statusFor(device.name)?.error"
-                     x-text="statusFor(device.name)?.error">
+                     :title="statusFor(device, i)?.error"
+                     x-text="statusFor(device, i)?.error">
                   </p>
                 </div>
               </div>
@@ -321,8 +321,15 @@
           }
         },
 
-        statusFor(name) {
-          return this.statuses.find(s => s.name === name)
+        // Match by position, not name: /api/devices/status returns one entry per
+        // configured device in config order, and friendly names are neither
+        // unique nor always set — a name lookup gave two same-named devices (or
+        // every not-yet-named row) the first match's state. The name check keeps
+        // us honest when the local list has unsaved adds/removes and the indexes
+        // no longer line up: better "unknown" than another device's status.
+        statusFor(device, i) {
+          const s = this.statuses[i]
+          return s && s.name === device.name ? s : undefined
         },
 
         scanPercent() {

@@ -91,6 +91,22 @@ func setCastState(dev DeviceConfig, playing bool) {
 	castStatesMu.Unlock()
 }
 
+// observeCastState records what a status poll saw, without disturbing a recorded
+// cast error the way setCastState does. Polling and acting are not the same
+// event: a poll that finds the device idle is usually the *consequence* of the
+// failed cast, and clearing the error there erased it before
+// getDeviceStatus could merge it in — every failure read as a plain "Idle".
+// An observed *playing* device does mean the last error is stale, so drop it.
+func observeCastState(dev DeviceConfig, playing bool) {
+	k := deviceKey(dev)
+	castStatesMu.Lock()
+	castStates[k] = playing
+	if playing {
+		delete(castErrors, k)
+	}
+	castStatesMu.Unlock()
+}
+
 func isCasting(dev DeviceConfig) bool {
 	castStatesMu.RLock()
 	defer castStatesMu.RUnlock()
@@ -349,13 +365,13 @@ func getPychromecastStatus(ctx context.Context, dev DeviceConfig) DeviceStatus {
 	}
 	if result.IsIdle {
 		ds.State = "Idle"
-		setCastState(dev, false)
+		observeCastState(dev, false)
 	} else {
 		ds.State = result.DisplayName
 		if ds.State == "" {
 			ds.State = "Playing"
 		}
-		setCastState(dev, true)
+		observeCastState(dev, true)
 	}
 	return ds
 }
@@ -382,7 +398,15 @@ func monitorDevices(ctx context.Context) {
 		// to it) is never recovered, because nothing clears the flag unless a
 		// browser happens to be polling /api/devices/status.
 		if dev.Host != "" {
-			getPychromecastStatus(ctx, dev)
+			// A probe error means the device is off or unreachable, so a cast
+			// cannot succeed. Skipping it matters: catt would spend its full 30s
+			// timeout failing, serially, and a couple of powered-off TVs were
+			// enough to keep the loop permanently busy and starve the devices
+			// that were actually up.
+			if st := getPychromecastStatus(ctx, dev); st.Error != "" {
+				log.Printf("skipping auto-cast to %q: %s", dev.Name, st.Error)
+				continue
+			}
 		}
 		if isCasting(dev) {
 			continue
@@ -836,6 +860,9 @@ func handleCast(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	// Bound the body like /api/config does: unauthenticated on the LAN, and an
+	// unbounded json.Decode will consume all available memory.
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
 	var req struct {
 		Name string `json:"name"`
 		Host string `json:"host"`
@@ -872,6 +899,7 @@ func handleStop(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
 	var req struct {
 		Name string `json:"name"`
 		Host string `json:"host"`

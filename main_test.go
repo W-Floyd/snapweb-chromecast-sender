@@ -217,6 +217,34 @@ func TestCastErrorRecordedAndCleared(t *testing.T) {
 	}
 }
 
+func TestObserveCastStateKeepsErrorWhileIdle(t *testing.T) {
+	castStatesMu.Lock()
+	castStates, castErrors = map[string]bool{}, map[string]string{}
+	castStatesMu.Unlock()
+
+	dev := DeviceConfig{Name: "Kitchen", Host: "1.2.3.4"}
+	setCastError(dev, "Chromecast not found")
+
+	// A status poll seeing the device idle is the consequence of that failure,
+	// not new information — it must not erase the reason.
+	observeCastState(dev, false)
+	if got := castError(dev); got != "Chromecast not found" {
+		t.Errorf("idle observation cleared the cast error: %q", got)
+	}
+	if isCasting(dev) {
+		t.Error("device observed idle should not be marked casting")
+	}
+
+	// Seeing it play means the error is stale.
+	observeCastState(dev, true)
+	if got := castError(dev); got != "" {
+		t.Errorf("playing observation left a stale error: %q", got)
+	}
+	if !isCasting(dev) {
+		t.Error("device observed playing should be marked casting")
+	}
+}
+
 func TestCattFailureAlwaysExplains(t *testing.T) {
 	if got := cattFailure(errors.New("signal: killed"), "  \n "); got != "signal: killed" {
 		t.Errorf("empty output should fall back to the exec error, got %q", got)
