@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -106,15 +107,40 @@ func saveConfig() error {
 		return err
 	}
 	// Write to a temp file and rename so a crash mid-write cannot truncate
-	// the existing config.
-	tmp := cfgPath + ".tmp"
-	if err := os.WriteFile(tmp, data, 0644); err != nil {
+	// the existing config. The temp name must be unique: two concurrent POSTs
+	// to /api/config sharing one fixed path would interleave their writes and
+	// rename a half-and-half file into place.
+	f, err := os.CreateTemp(filepath.Dir(cfgPath), ".config-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer func() {
+		if tmp != "" {
+			os.Remove(tmp)
+		}
+	}()
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	// Flush to disk before the rename, or a crash right after it leaves a
+	// zero-length config that loadConfig will discard on next start.
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	// CreateTemp makes the file 0600; the config is read by the container user.
+	if err := os.Chmod(tmp, 0644); err != nil {
 		return err
 	}
 	if err := os.Rename(tmp, cfgPath); err != nil {
-		os.Remove(tmp)
 		return err
 	}
+	tmp = "" // renamed away; nothing left to clean up
 	return nil
 }
 
@@ -168,15 +194,34 @@ func getPychromecastStatus(dev DeviceConfig) DeviceStatus {
 	ds := DeviceStatus{Name: dev.Name, State: "unknown"}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	// CombinedOutput so any Python tracebacks appear in ds.Error
-	out, _ := exec.CommandContext(ctx, "python3", statusScript, dev.Host).CombinedOutput()
+	// Keep stderr out of stdout: zeroconf/pychromecast log lines and Python
+	// warnings land on stderr, and mixing them into stdout makes the JSON
+	// unparseable even when the query itself succeeded.
+	cmd := exec.CommandContext(ctx, "python3", statusScript, dev.Host)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	runErr := cmd.Run()
+
 	var result struct {
 		DisplayName string `json:"display_name"`
 		IsIdle      bool   `json:"is_idle"`
 		Error       string `json:"error"`
 	}
-	if err := json.Unmarshal(out, &result); err != nil {
-		ds.Error = strings.TrimSpace(string(out))
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		// Report the most useful diagnostic available. Previously a missing
+		// python3 or an empty stdout produced an empty Error, leaving the UI
+		// with no explanation at all.
+		switch {
+		case strings.TrimSpace(stderr.String()) != "":
+			ds.Error = strings.TrimSpace(stderr.String())
+		case strings.TrimSpace(stdout.String()) != "":
+			ds.Error = strings.TrimSpace(stdout.String())
+		case runErr != nil:
+			ds.Error = runErr.Error()
+		default:
+			ds.Error = "no status output from " + statusScript
+		}
 		return ds
 	}
 	if result.Error != "" {
@@ -286,6 +331,10 @@ func cattScan() []DiscoveredDevice {
 	if err != nil {
 		log.Printf("catt scan: %v — %s", err, strings.TrimSpace(out))
 	}
+	return parseCattScan(out)
+}
+
+func parseCattScan(out string) []DiscoveredDevice {
 	var devices []DiscoveredDevice
 	var cur DiscoveredDevice
 	scanner := bufio.NewScanner(strings.NewReader(out))
@@ -293,12 +342,30 @@ func cattScan() []DiscoveredDevice {
 		line := strings.TrimSpace(scanner.Text())
 		if after, ok := strings.CutPrefix(line, "Name:"); ok {
 			cur.Name = strings.TrimSpace(after)
-		} else if after, ok := strings.CutPrefix(line, "Host:"); ok {
+			continue
+		}
+		if after, ok := strings.CutPrefix(line, "Host:"); ok {
 			cur.Host = strings.TrimSpace(after)
 			if cur.Name != "" {
 				devices = append(devices, cur)
 				cur = DiscoveredDevice{}
 			}
+			continue
+		}
+		// catt actually prints one device per line as
+		//   "<ip> - <friendly name> - <manufacturer> <model>"
+		// so the labelled form above never matched and mDNS discovery always
+		// came back empty, silently falling through to the TCP scan.
+		host, rest, ok := strings.Cut(line, " - ")
+		if !ok || net.ParseIP(strings.TrimSpace(host)) == nil {
+			continue
+		}
+		name := rest
+		if before, _, ok := strings.Cut(rest, " - "); ok {
+			name = before // trailing " - <manufacturer> <model>"
+		}
+		if name = strings.TrimSpace(name); name != "" {
+			devices = append(devices, DiscoveredDevice{Name: name, Host: strings.TrimSpace(host)})
 		}
 	}
 	return devices
@@ -345,9 +412,12 @@ type ScanEvent struct {
 	Type    string            `json:"type"`
 	Message string            `json:"message,omitempty"`
 	Device  *DiscoveredDevice `json:"device,omitempty"`
-	Checked int               `json:"checked,omitempty"`
-	Total   int               `json:"total,omitempty"`
-	Count   int               `json:"count"`
+	// No omitempty: a progress event with checked == 0 would drop the field
+	// entirely, and the UI then renders "undefined / 254 hosts" and a NaN%
+	// progress bar width.
+	Checked int `json:"checked"`
+	Total   int `json:"total"`
+	Count   int `json:"count"`
 }
 
 // parseSubnet accepts any of: "192.168.1", "192.168.1.0/24", "192.168.1.x",
@@ -420,6 +490,9 @@ func tcpScan(ctx context.Context, subnets []string, onStatus func(string), onFou
 		sem     = make(chan struct{}, 50)
 		client  = &http.Client{Timeout: 2 * time.Second}
 	)
+	// A scan can open a connection to every responding host; without this they
+	// sit in the shared idle pool until their keep-alive expires.
+	defer client.CloseIdleConnections()
 
 	// Ticker goroutine for progress events; stopped before tcpScan returns.
 	stopTicker := make(chan struct{})

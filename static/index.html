@@ -77,6 +77,11 @@
                   <p class="text-slate-400 text-xs mt-0.5 capitalize"
                      x-text="statusFor(device.name)?.state || 'unknown'">
                   </p>
+                  <p x-show="statusFor(device.name)?.error"
+                     class="text-red-400 text-xs mt-1 break-all line-clamp-3"
+                     :title="statusFor(device.name)?.error"
+                     x-text="statusFor(device.name)?.error">
+                  </p>
                 </div>
               </div>
               <label class="flex items-center gap-1.5 text-xs text-slate-400 cursor-pointer select-none">
@@ -209,7 +214,9 @@
       </div>
 
       <div class="grid gap-3 sm:grid-cols-2">
-        <template x-for="device in discoveredDevices" :key="device.name">
+        <!-- Keyed by host, not name: two Chromecasts can share a friendly name,
+             and a duplicate x-for key makes Alpine throw and drop the list. -->
+        <template x-for="device in discoveredDevices" :key="device.host">
           <div class="bg-slate-800 rounded-xl p-4 border border-slate-700 flex items-center justify-between">
             <div>
               <p class="font-medium text-white text-sm" x-text="device.name"></p>
@@ -362,10 +369,6 @@
             this.scanStatus = 'Scan failed'
             this.notify('Scan failed', 'error')
           }
-        },
-
-        isDeviceConfigured(name) {
-          return this.config.devices.some(d => d.name === name)
         },
 
         scanAddState(name) {

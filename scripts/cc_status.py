@@ -40,7 +40,11 @@ def main():
         }))
 
     except Exception as e:
-        print(json.dumps({"error": str(e), "detail": traceback.format_exc()}))
+        # Some exceptions stringify to "" (e.g. bare socket errors). An empty
+        # "error" reads as success on the Go side, which then reports the
+        # device as playing, so always fall back to the exception type name.
+        message = str(e).strip() or type(e).__name__
+        print(json.dumps({"error": message, "detail": traceback.format_exc()}))
         sys.exit(1)
     finally:
         if cast:
