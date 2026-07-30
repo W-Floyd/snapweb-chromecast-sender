@@ -282,12 +282,21 @@
         async saveConfig() {
           this.saving = true
           try {
+            // Clearing the number input leaves x-model.number holding '', which
+            // the Go decoder rejects with an opaque 400. Coerce it here, and let
+            // the server's response tell us what it actually stored (it clamps
+            // the interval to a floor).
+            const payload = {
+              ...this.config,
+              check_interval: Number(this.config.check_interval) || 60,
+            }
             const res = await fetch('/api/config', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(this.config),
+              body: JSON.stringify(payload),
             })
             if (!res.ok) throw new Error(await res.text())
+            await this.loadConfig()
             this.notify('Config saved', 'success')
           } catch (e) {
             this.notify('Save failed: ' + e.message, 'error')
@@ -353,11 +362,19 @@
               case 'done':
                 this.scanning = false
                 this.scanProgress = null
-                this.scanStatus = evt.count === 0
-                  ? 'No devices found'
-                  : `Done — found ${evt.count} device${evt.count !== 1 ? 's' : ''}`
                 es.close()
-                if (evt.count === 0) this.notify('No Chromecast devices found', 'error')
+                // A message on the done event is the server explaining why it
+                // stopped (bad subnet, scan already running). Prefer it — the
+                // generic "no devices" text would bury the actual reason.
+                if (evt.message) {
+                  this.scanStatus = evt.message
+                  this.notify(evt.message, 'error')
+                } else if (evt.count === 0) {
+                  this.scanStatus = 'No devices found'
+                  this.notify('No Chromecast devices found', 'error')
+                } else {
+                  this.scanStatus = `Done — found ${evt.count} device${evt.count !== 1 ? 's' : ''}`
+                }
                 break
             }
           }

@@ -55,47 +55,141 @@ var (
 	staticDir    = "/static"
 	statusScript = "/usr/local/lib/chromecast/cc_status.py"
 
-	// castStates tracks devices we have actively cast to.
+	// castStates tracks devices we have actively cast to, keyed by deviceKey.
 	// catt gives no signal for web-page cast state, so we track it ourselves.
-	castStates   = map[string]bool{}
+	castStates = map[string]bool{}
+	// castErrors holds why the most recent cast/stop attempt failed, keyed by
+	// deviceKey. /api/devices/cast answers before catt has run, so without this
+	// a failed cast looks identical to a successful one in the UI — the device
+	// just quietly stays idle and the reason is only ever in the server log.
+	castErrors   = map[string]string{}
 	castStatesMu sync.RWMutex
+
+	// scanInFlight serialises /api/devices/scan. A TCP scan fans out to every
+	// host on the subnet; letting impatient re-clicks stack them up multiplies
+	// that load for no benefit.
+	scanInFlight atomic.Bool
 )
 
-func setCastState(name string, playing bool) {
+// deviceKey identifies a device for cast-state tracking. Friendly names are not
+// unique — two Chromecasts can legitimately share one — so prefer the IP when
+// we have it, otherwise state for one device leaks onto the other.
+func deviceKey(dev DeviceConfig) string {
+	if dev.Host != "" {
+		return "host:" + dev.Host
+	}
+	return "name:" + dev.Name
+}
+
+// setCastState records the outcome of a successful cast/stop, and clears any
+// error left by a previous failed attempt on the same device.
+func setCastState(dev DeviceConfig, playing bool) {
+	k := deviceKey(dev)
 	castStatesMu.Lock()
-	castStates[name] = playing
+	castStates[k] = playing
+	delete(castErrors, k)
 	castStatesMu.Unlock()
 }
 
-func isCasting(name string) bool {
+func isCasting(dev DeviceConfig) bool {
 	castStatesMu.RLock()
 	defer castStatesMu.RUnlock()
-	return castStates[name]
+	return castStates[deviceKey(dev)]
+}
+
+// maxCastErrLen bounds what we keep from catt's output; a failure can print a
+// full Python traceback, and all of it would end up in every status response.
+const maxCastErrLen = 400
+
+func setCastError(dev DeviceConfig, msg string) {
+	msg = strings.TrimSpace(msg)
+	// Slice by runes, not bytes: a byte-slice can cut a multi-byte character in
+	// half and produce invalid UTF-8 in the JSON response.
+	if r := []rune(msg); len(r) > maxCastErrLen {
+		msg = string(r[:maxCastErrLen]) + "…"
+	}
+	k := deviceKey(dev)
+	castStatesMu.Lock()
+	castStates[k] = false
+	castErrors[k] = msg
+	castStatesMu.Unlock()
+}
+
+func castError(dev DeviceConfig) string {
+	castStatesMu.RLock()
+	defer castStatesMu.RUnlock()
+	return castErrors[deviceKey(dev)]
+}
+
+// pruneCastStates drops entries for devices no longer in the config, so the map
+// does not grow without bound across edits over the process lifetime.
+func pruneCastStates(devices []DeviceConfig) {
+	keep := make(map[string]bool, len(devices))
+	for _, d := range devices {
+		keep[deviceKey(d)] = true
+	}
+	castStatesMu.Lock()
+	for k := range castStates {
+		if !keep[k] {
+			delete(castStates, k)
+		}
+	}
+	for k := range castErrors {
+		if !keep[k] {
+			delete(castErrors, k)
+		}
+	}
+	castStatesMu.Unlock()
+}
+
+// normalizeConfig fills in defaults and clamps values so that what we store,
+// serve from GET /api/config, and actually act on are the same thing. Without
+// the clamp the UI could display check_interval: 2 while the monitor silently
+// ran at 10.
+func normalizeConfig(c *Config) {
+	if c.Devices == nil {
+		c.Devices = []DeviceConfig{}
+	}
+	if c.CheckInterval <= 0 {
+		c.CheckInterval = 60
+	}
+	if c.CheckInterval < minCheckInterval {
+		c.CheckInterval = minCheckInterval
+	}
+	c.DefaultURL = strings.TrimSpace(c.DefaultURL)
+	// Device names must match what the Chromecast advertises exactly, so a
+	// trailing space from a copy-paste silently breaks every catt call.
+	for i := range c.Devices {
+		c.Devices[i].Name = strings.TrimSpace(c.Devices[i].Name)
+		c.Devices[i].Host = strings.TrimSpace(c.Devices[i].Host)
+		c.Devices[i].URL = strings.TrimSpace(c.Devices[i].URL)
+	}
 }
 
 func loadConfig() {
 	cfgMu.Lock()
 	defer cfgMu.Unlock()
 
+	fallback := Config{}
+	normalizeConfig(&fallback)
+
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			log.Printf("config read error: %v", err)
 		}
-		cfg = Config{CheckInterval: 60, Devices: []DeviceConfig{}}
+		cfg = fallback
 		return
 	}
 	// Unmarshal into a scratch value so a malformed file cannot leave cfg
 	// half-populated with a mix of defaults and file contents.
-	loaded := Config{CheckInterval: 60}
+	var loaded Config
 	if err := json.Unmarshal(data, &loaded); err != nil {
 		log.Printf("config parse error: %v", err)
-		cfg = Config{CheckInterval: 60, Devices: []DeviceConfig{}}
+		cfg = fallback
 		return
 	}
-	if loaded.Devices == nil {
-		loaded.Devices = []DeviceConfig{}
-	}
+	normalizeConfig(&loaded)
 	cfg = loaded
 }
 
@@ -154,26 +248,51 @@ func cattDeviceArgs(dev DeviceConfig) []string {
 	return []string{"-d", dev.Name}
 }
 
-func runCatt(timeout time.Duration, args ...string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+// runCatt runs catt with a timeout. The parent ctx lets a caller abandon the
+// subprocess early — an HTTP handler whose client has disconnected, say —
+// instead of leaving it to run out its full timeout.
+func runCatt(ctx context.Context, timeout time.Duration, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "catt", args...).CombinedOutput()
 	return string(out), err
 }
 
-func getDeviceStatus(dev DeviceConfig) DeviceStatus {
+// cattFailure builds a human-readable reason from a failed catt invocation.
+// catt exits non-zero with nothing on the pipe for some failures (and a
+// subprocess killed by our timeout prints nothing at all), so falling back to
+// the exec error keeps us from reporting an empty explanation.
+func cattFailure(err error, out string) string {
+	if msg := strings.TrimSpace(out); msg != "" {
+		return msg
+	}
+	return err.Error()
+}
+
+func getDeviceStatus(ctx context.Context, dev DeviceConfig) DeviceStatus {
+	ds := getLiveStatus(ctx, dev)
+	// Surface the last failed cast/stop when the device itself has nothing to
+	// report. Otherwise a cast that failed is indistinguishable from one that
+	// never happened: the card just reads "Idle".
+	if ds.Error == "" {
+		ds.Error = castError(dev)
+	}
+	return ds
+}
+
+func getLiveStatus(ctx context.Context, dev DeviceConfig) DeviceStatus {
 	if dev.Host != "" {
-		return getPychromecastStatus(dev)
+		return getPychromecastStatus(ctx, dev)
 	}
 	// Fall back to catt when no host IP is configured.
 	args := append(cattDeviceArgs(dev), "status")
-	out, err := runCatt(10*time.Second, args...)
+	out, err := runCatt(ctx, 10*time.Second, args...)
 	ds := DeviceStatus{Name: dev.Name, State: "unknown"}
 	if err != nil {
-		ds.Error = strings.TrimSpace(out)
+		ds.Error = cattFailure(err, out)
 		return ds
 	}
-	if isCasting(dev.Name) {
+	if isCasting(dev) {
 		ds.State = "Playing"
 	} else {
 		ds.State = "Idle"
@@ -190,9 +309,9 @@ func getDeviceStatus(dev DeviceConfig) DeviceStatus {
 	return ds
 }
 
-func getPychromecastStatus(dev DeviceConfig) DeviceStatus {
+func getPychromecastStatus(ctx context.Context, dev DeviceConfig) DeviceStatus {
 	ds := DeviceStatus{Name: dev.Name, State: "unknown"}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	// Keep stderr out of stdout: zeroconf/pychromecast log lines and Python
 	// warnings land on stderr, and mixing them into stdout makes the JSON
@@ -230,18 +349,18 @@ func getPychromecastStatus(dev DeviceConfig) DeviceStatus {
 	}
 	if result.IsIdle {
 		ds.State = "Idle"
-		setCastState(dev.Name, false)
+		setCastState(dev, false)
 	} else {
 		ds.State = result.DisplayName
 		if ds.State == "" {
 			ds.State = "Playing"
 		}
-		setCastState(dev.Name, true)
+		setCastState(dev, true)
 	}
 	return ds
 }
 
-func monitorDevices() {
+func monitorDevices(ctx context.Context) {
 	cfgMu.RLock()
 	devices := append([]DeviceConfig{}, cfg.Devices...)
 	defaultURL := cfg.DefaultURL
@@ -263,33 +382,31 @@ func monitorDevices() {
 		// to it) is never recovered, because nothing clears the flag unless a
 		// browser happens to be polling /api/devices/status.
 		if dev.Host != "" {
-			getPychromecastStatus(dev)
+			getPychromecastStatus(ctx, dev)
 		}
-		if isCasting(dev.Name) {
+		if isCasting(dev) {
 			continue
 		}
 		log.Printf("auto-casting to %q: %s", dev.Name, url)
 		args := append(cattDeviceArgs(dev), "cast_site", url)
-		out, err := runCatt(30*time.Second, args...)
+		out, err := runCatt(ctx, 30*time.Second, args...)
 		if err != nil {
 			log.Printf("cast error for %q: %v — %s", dev.Name, err, strings.TrimSpace(out))
+			setCastError(dev, cattFailure(err, out))
 		} else {
-			setCastState(dev.Name, true)
+			setCastState(dev, true)
 		}
 	}
 }
 
 func monitorLoop() {
 	for {
-		monitorDevices()
+		monitorDevices(context.Background())
 		cfgMu.RLock()
 		interval := cfg.CheckInterval
 		cfgMu.RUnlock()
-		if interval <= 0 {
-			interval = 60
-		}
-		// Floor the interval: a small or hand-edited value would otherwise
-		// hammer every device with status queries in a near-hot loop.
+		// Defensive floor: normalizeConfig already guarantees this, but a hot
+		// loop here would hammer every device with status queries.
 		if interval < minCheckInterval {
 			interval = minCheckInterval
 		}
@@ -298,36 +415,45 @@ func monitorLoop() {
 }
 
 func handleConfig(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
 	switch r.Method {
 	case http.MethodGet:
+		w.Header().Set("Content-Type", "application/json")
 		cfgMu.RLock()
-		defer cfgMu.RUnlock()
-		json.NewEncoder(w).Encode(cfg)
+		snapshot := cfg
+		snapshot.Devices = append([]DeviceConfig{}, cfg.Devices...)
+		cfgMu.RUnlock()
+		// Encode outside the lock: a slow client would otherwise block every
+		// config writer for as long as it takes to drain the response.
+		json.NewEncoder(w).Encode(snapshot)
 	case http.MethodPost:
+		// Bound the body — this endpoint is unauthenticated on the LAN, and
+		// json.Decode on an unbounded stream will happily consume all memory.
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		var newCfg Config
 		if err := json.NewDecoder(r.Body).Decode(&newCfg); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if newCfg.Devices == nil {
-			newCfg.Devices = []DeviceConfig{}
-		}
+		normalizeConfig(&newCfg)
 		cfgMu.Lock()
 		cfg = newCfg
 		cfgMu.Unlock()
+		// Devices can be renamed, re-addressed or deleted here; drop the cast
+		// state of anything that no longer exists.
+		pruneCastStates(newCfg.Devices)
 		if err := saveConfig(); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 
-func cattScan() []DiscoveredDevice {
-	out, err := runCatt(30*time.Second, "scan")
+func cattScan(ctx context.Context) []DiscoveredDevice {
+	out, err := runCatt(ctx, 30*time.Second, "scan")
 	if err != nil {
 		log.Printf("catt scan: %v — %s", err, strings.TrimSpace(out))
 	}
@@ -371,13 +497,47 @@ func parseCattScan(out string) []DiscoveredDevice {
 	return devices
 }
 
-// localSubnets returns the /24 base (e.g. "192.168.1") for each non-loopback IPv4 interface.
+// virtualIfacePrefixes names interfaces that cannot have a Chromecast on them:
+// container and VM bridges, VPN tunnels, and virtual ethernet pairs. A host
+// running Docker has one bridge per compose network, and including them turned
+// an auto-detect scan into ~2800 pointless probes across eleven subnets
+// instead of 254 across the one LAN the user actually cares about.
+var virtualIfacePrefixes = []string{
+	"docker", "br-", "veth", "virbr", "cni", "flannel", "tailscale",
+	"tun", "tap", "utun", "zt", "wg",
+}
+
+func isVirtualIface(name string) bool {
+	for _, p := range virtualIfacePrefixes {
+		if strings.HasPrefix(name, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// localSubnets returns the /24 base (e.g. "192.168.1") for each usable
+// non-loopback IPv4 interface, preferring physical ones.
 func localSubnets() []string {
+	physical, all := collectSubnets(true), collectSubnets(false)
+	// Fall back to the unfiltered set rather than returning nothing: the prefix
+	// list is a heuristic, and on an unusual host it could filter out the only
+	// interface there is.
+	if len(physical) == 0 {
+		return all
+	}
+	return physical
+}
+
+func collectSubnets(skipVirtual bool) []string {
 	ifaces, _ := net.Interfaces()
 	var subnets []string
 	seen := map[string]bool{}
 	for _, iface := range ifaces {
 		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		if skipVirtual && isVirtualIface(iface.Name) {
 			continue
 		}
 		addrs, _ := iface.Addrs()
@@ -389,10 +549,16 @@ func localSubnets() []string {
 			case *net.IPAddr:
 				ip = v.IP
 			}
-			if ip == nil || ip.To4() == nil {
+			v4 := net.IP(nil)
+			if ip != nil {
+				v4 = ip.To4()
+			}
+			// Skip link-local (169.254/16): an interface that failed DHCP has
+			// no peers worth probing.
+			if v4 == nil || v4.IsLinkLocalUnicast() {
 				continue
 			}
-			parts := strings.Split(ip.To4().String(), ".")
+			parts := strings.Split(v4.String(), ".")
 			if len(parts) == 4 {
 				// Multiple interfaces / aliases can share a /24. Deduplicate,
 				// or the TCP scan probes every host twice and reports a
@@ -595,14 +761,25 @@ func handleScan(w http.ResponseWriter, r *http.Request) {
 		writeMu.Unlock()
 	}
 
+	// One scan at a time. A TCP scan probes every host on the subnet; stacking
+	// them up (impatient re-clicks, a second browser tab) multiplies that load
+	// on the network for no extra coverage.
+	// The message rides on the "done" event, not a preceding "status" one: the
+	// UI overwrites scanStatus when the stream ends, so a status-then-done pair
+	// leaves the user reading "No devices found" instead of the real reason.
+	if !scanInFlight.CompareAndSwap(false, true) {
+		send(ScanEvent{Type: "done", Message: "A scan is already running — try again when it finishes"})
+		return
+	}
+	defer scanInFlight.Store(false)
+
 	// Parse optional explicit subnet (skips catt scan when provided).
 	var explicitSubnets []string
 	if s := r.URL.Query().Get("subnet"); s != "" {
 		if base := parseSubnet(s); base != "" {
 			explicitSubnets = []string{base}
 		} else {
-			send(ScanEvent{Type: "status", Message: "Invalid subnet — expected e.g. 192.168.1.0/24"})
-			send(ScanEvent{Type: "done", Count: 0})
+			send(ScanEvent{Type: "done", Message: "Invalid subnet — expected e.g. 192.168.1.0/24"})
 			return
 		}
 	}
@@ -611,7 +788,7 @@ func handleScan(w http.ResponseWriter, r *http.Request) {
 
 	if len(explicitSubnets) == 0 {
 		send(ScanEvent{Type: "status", Message: "Running mDNS scan via catt..."})
-		devices = cattScan()
+		devices = cattScan(ctx)
 		if len(devices) > 0 {
 			for i := range devices {
 				send(ScanEvent{Type: "found", Device: &devices[i]})
@@ -639,18 +816,16 @@ func handleDeviceStatus(w http.ResponseWriter, r *http.Request) {
 	devices := append([]DeviceConfig{}, cfg.Devices...)
 	cfgMu.RUnlock()
 
-	statuses := make([]DeviceStatus, 0, len(devices))
-	var mu sync.Mutex
+	// Index-assigned rather than appended: append order is whichever device
+	// answered first, which reshuffles the list on every poll.
+	statuses := make([]DeviceStatus, len(devices))
 	var wg sync.WaitGroup
-	for _, dev := range devices {
+	for i, dev := range devices {
 		wg.Add(1)
-		go func(d DeviceConfig) {
+		go func(i int, d DeviceConfig) {
 			defer wg.Done()
-			s := getDeviceStatus(d)
-			mu.Lock()
-			statuses = append(statuses, s)
-			mu.Unlock()
-		}(dev)
+			statuses[i] = getDeviceStatus(r.Context(), d)
+		}(i, dev)
 	}
 	wg.Wait()
 	json.NewEncoder(w).Encode(statuses)
@@ -677,11 +852,15 @@ func handleCast(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		dev := DeviceConfig{Name: req.Name, Host: req.Host}
 		args := append(cattDeviceArgs(dev), "cast_site", req.URL)
-		out, err := runCatt(30*time.Second, args...)
+		// context.Background, not r.Context: this outlives the response we are
+		// about to write, and the request context is cancelled the moment the
+		// handler returns.
+		out, err := runCatt(context.Background(), 30*time.Second, args...)
 		if err != nil {
 			log.Printf("cast %q -> %s: %v — %s", req.Name, req.URL, err, strings.TrimSpace(out))
+			setCastError(dev, cattFailure(err, out))
 		} else {
-			setCastState(req.Name, true)
+			setCastState(dev, true)
 		}
 	}()
 	w.Header().Set("Content-Type", "application/json")
@@ -708,11 +887,12 @@ func handleStop(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		dev := DeviceConfig{Name: req.Name, Host: req.Host}
 		args := append(cattDeviceArgs(dev), "stop")
-		out, err := runCatt(15*time.Second, args...)
+		out, err := runCatt(context.Background(), 15*time.Second, args...)
 		if err != nil {
 			log.Printf("stop %q: %v — %s", req.Name, err, strings.TrimSpace(out))
+			setCastError(dev, cattFailure(err, out))
 		} else {
-			setCastState(req.Name, false)
+			setCastState(dev, false)
 		}
 	}()
 	w.Header().Set("Content-Type", "application/json")

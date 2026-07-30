@@ -75,7 +75,9 @@ Use **Scan Network** to discover devices, add them to config, set their IP in th
 - For mDNS scanning to work, deploy on Linux with `network_mode: host` (see commented section in `docker-compose.yml`)
 - Auto-cast devices with a `host` set are polled for their real state each interval, so a device that reboots or gets used for something else is re-cast once it returns to idle
 - The scanner's subnet field accepts `192.168.1.0/24`, `192.168.1.x`, `192.168.1`, or any address in the subnet
+- Subnet auto-detection ignores container bridges and VPN tunnels (`docker0`, `br-*`, `veth*`, `tun*`, …), so a host running Docker scans its LAN rather than every compose network. Set the subnet explicitly if your devices really are behind one of those
+- Only one network scan runs at a time; a second request is told to wait rather than doubling the probe load
 
 ## Screenshot
 
-![alt text](image.png)
+![Web UI showing configured Chromecast devices, config fields, and the network scanner](image.png)

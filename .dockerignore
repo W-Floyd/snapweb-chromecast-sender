@@ -1,0 +1,15 @@
+.git
+.github
+
+# Locally built binary — the image builds its own.
+chromecast-sender
+
+# Would otherwise be COPYed into /usr/local/lib/chromecast as stale bytecode
+# compiled by a different Python than the runtime image's.
+**/__pycache__
+
+# Local runtime state; must not be baked into the image.
+config
+
+README.md
+image.png

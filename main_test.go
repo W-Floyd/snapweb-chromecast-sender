@@ -2,9 +2,12 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestParseSubnet(t *testing.T) {
@@ -121,6 +124,108 @@ func TestScanEventProgressAlwaysHasCounts(t *testing.T) {
 	}
 }
 
+func TestNormalizeConfig(t *testing.T) {
+	c := Config{CheckInterval: 0}
+	normalizeConfig(&c)
+	if c.CheckInterval != 60 {
+		t.Errorf("zero interval = %d, want default 60", c.CheckInterval)
+	}
+	if c.Devices == nil {
+		t.Error("nil Devices should normalize to an empty slice")
+	}
+
+	c = Config{CheckInterval: 3}
+	normalizeConfig(&c)
+	if c.CheckInterval != minCheckInterval {
+		t.Errorf("interval 3 = %d, want floor %d", c.CheckInterval, minCheckInterval)
+	}
+
+	c = Config{
+		CheckInterval: 30,
+		DefaultURL:    "  http://example/  ",
+		Devices:       []DeviceConfig{{Name: " Living Room ", Host: " 1.2.3.4 ", URL: " http://x/ "}},
+	}
+	normalizeConfig(&c)
+	if c.DefaultURL != "http://example/" {
+		t.Errorf("DefaultURL = %q, want trimmed", c.DefaultURL)
+	}
+	if d := c.Devices[0]; d.Name != "Living Room" || d.Host != "1.2.3.4" || d.URL != "http://x/" {
+		t.Errorf("device not trimmed: %+v", d)
+	}
+	if c.CheckInterval != 30 {
+		t.Errorf("valid interval was altered: %d", c.CheckInterval)
+	}
+}
+
+func TestCastStateKeyedByHost(t *testing.T) {
+	castStatesMu.Lock()
+	castStates = map[string]bool{}
+	castStatesMu.Unlock()
+
+	// Two devices sharing a friendly name must not share cast state.
+	a := DeviceConfig{Name: "Speaker", Host: "1.2.3.4"}
+	b := DeviceConfig{Name: "Speaker", Host: "5.6.7.8"}
+	setCastState(a, true)
+	if !isCasting(a) {
+		t.Error("a should be casting")
+	}
+	if isCasting(b) {
+		t.Error("b must not inherit a's cast state")
+	}
+
+	// Devices dropped from the config must not linger in the map.
+	pruneCastStates([]DeviceConfig{b})
+	if isCasting(a) {
+		t.Error("pruned device still marked casting")
+	}
+	castStatesMu.RLock()
+	n := len(castStates)
+	castStatesMu.RUnlock()
+	if n != 0 {
+		t.Errorf("castStates has %d stale entries after prune", n)
+	}
+}
+
+func TestCastErrorRecordedAndCleared(t *testing.T) {
+	castStatesMu.Lock()
+	castStates, castErrors = map[string]bool{}, map[string]string{}
+	castStatesMu.Unlock()
+
+	dev := DeviceConfig{Name: "Kitchen", Host: "1.2.3.4"}
+	setCastError(dev, "  Chromecast not found  ")
+	if got := castError(dev); got != "Chromecast not found" {
+		t.Errorf("castError = %q, want trimmed message", got)
+	}
+	if isCasting(dev) {
+		t.Error("a failed cast must not leave the device marked as casting")
+	}
+
+	// A later success clears the stale error.
+	setCastState(dev, true)
+	if got := castError(dev); got != "" {
+		t.Errorf("error not cleared after success: %q", got)
+	}
+
+	// Long output is truncated without splitting a multi-byte rune.
+	setCastError(dev, strings.Repeat("é", maxCastErrLen*2))
+	got := castError(dev)
+	if !utf8.ValidString(got) {
+		t.Errorf("truncated message is not valid UTF-8: %q", got)
+	}
+	if n := utf8.RuneCountInString(got); n != maxCastErrLen+1 { // +1 for the ellipsis
+		t.Errorf("truncated to %d runes, want %d", n, maxCastErrLen+1)
+	}
+}
+
+func TestCattFailureAlwaysExplains(t *testing.T) {
+	if got := cattFailure(errors.New("signal: killed"), "  \n "); got != "signal: killed" {
+		t.Errorf("empty output should fall back to the exec error, got %q", got)
+	}
+	if got := cattFailure(errors.New("exit status 1"), "\nDevice not found.\n"); got != "Device not found." {
+		t.Errorf("catt output should win, got %q", got)
+	}
+}
+
 func TestLocalSubnetsAreUnique(t *testing.T) {
 	seen := map[string]bool{}
 	for _, s := range localSubnets() {
@@ -128,5 +233,19 @@ func TestLocalSubnetsAreUnique(t *testing.T) {
 			t.Errorf("duplicate subnet %q returned", s)
 		}
 		seen[s] = true
+	}
+}
+
+func TestIsVirtualIface(t *testing.T) {
+	virtual := []string{"docker0", "br-1a2b3c", "veth9f2", "virbr0", "utun3", "tailscale0"}
+	for _, n := range virtual {
+		if !isVirtualIface(n) {
+			t.Errorf("%q should be treated as virtual", n)
+		}
+	}
+	for _, n := range []string{"eth0", "en0", "wlan0", "enp3s0", "eno1"} {
+		if isVirtualIface(n) {
+			t.Errorf("%q should not be treated as virtual", n)
+		}
 	}
 }
