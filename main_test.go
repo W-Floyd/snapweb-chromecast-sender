@@ -56,6 +56,14 @@ func TestParseCattScan(t *testing.T) {
 		}
 	}
 
+	// A friendly name containing " - " must survive intact. Cutting at the first
+	// separator truncated it, and catt was then asked for a device that has no
+	// such name.
+	got = parseCattScan("192.168.1.7 - Kitchen - Nest Hub - Google Inc. Nest Hub\n")
+	if len(got) != 1 || got[0].Name != "Kitchen - Nest Hub" {
+		t.Errorf("name with a separator = %+v, want \"Kitchen - Nest Hub\"", got)
+	}
+
 	// Labelled form still works, and noise is ignored.
 	got = parseCattScan("Name: Bathroom\nHost: 192.168.1.134\nsome - unrelated - text\n")
 	if len(got) != 1 || got[0] != (DiscoveredDevice{Name: "Bathroom", Host: "192.168.1.134"}) {
@@ -224,8 +232,20 @@ func resetCastState() {
 	castStates, castErrors = map[string]bool{}, map[string]string{}
 	castActions = map[string]time.Time{}
 	castLearnPending = map[string]bool{}
-	learnedCastApp = ""
+	learnedCastApp, castAppCandidate = "", ""
 	castStatesMu.Unlock()
+}
+
+// learnCastApp drives the two-cast agreement that teaches us our own app id.
+func learnCastApp(t *testing.T, dev DeviceConfig, appID string) {
+	t.Helper()
+	for i := 0; i < 2; i++ {
+		setCastState(dev, true)
+		observeCastState(dev, true, appID, time.Now())
+	}
+	if isForeignApp(appID) || !isForeignApp(appID+"-other") {
+		t.Fatalf("app id %q was not learned after two agreeing casts", appID)
+	}
 }
 
 func TestObserveCastStateKeepsErrorWhileIdle(t *testing.T) {
@@ -303,24 +323,78 @@ func TestForeignAppDetection(t *testing.T) {
 		t.Error("an unlearned app must not be reported as foreign")
 	}
 
+	// One sighting is only a candidate — see castAppCandidate.
 	setCastState(dev, true)
-	observeCastState(dev, true, "84912283", time.Now()) // first poll after our cast
+	observeCastState(dev, true, "84912283", time.Now())
+	if isForeignApp("CA5E9605") {
+		t.Error("a single unconfirmed sighting must not be acted on")
+	}
+
+	learnCastApp(t, dev, "84912283")
 	if isForeignApp("84912283") {
 		t.Error("our own cast app reported as foreign")
-	}
-	if !isForeignApp("CA5E9605") {
-		t.Error("a different app should be reported as foreign")
 	}
 	// An empty app id is "cannot tell", not "someone else".
 	if isForeignApp("") {
 		t.Error("an empty app id must not be reported as foreign")
 	}
 
-	// Only the first poll after a cast teaches us; later polls of whatever
-	// someone else started must not redefine what our own cast looks like.
+	// Only a poll with the learn flag armed teaches us; an unsolicited poll of
+	// whatever someone else started must not redefine our own cast.
 	observeCastState(dev, true, "CA5E9605", time.Now())
 	if !isForeignApp("CA5E9605") {
 		t.Error("a later foreign observation overwrote the learned cast app")
+	}
+}
+
+// A wrong app id must not be permanent. It is fleet-wide, so a device without
+// takeover would never be cast again, and with no further casts there is no
+// later observation that could correct it — the service would be wedged until a
+// restart.
+func TestMislearnedCastAppSelfHeals(t *testing.T) {
+	resetCastState()
+	dev := DeviceConfig{Name: "Lounge", Host: "1.2.3.4"}
+
+	// Somebody starts Netflix in the gap between our cast and the poll, twice,
+	// so it is confirmed as "ours".
+	learnCastApp(t, dev, "CA5E9605")
+	if !isForeignApp("84912283") {
+		t.Fatal("setup: the real dashboard should now read as foreign")
+	}
+
+	// The next cast's poll sees the real dashboard and disagrees. That alone must
+	// drop the bad value, or nothing is ever cast again.
+	setCastState(dev, true)
+	observeCastState(dev, true, "84912283", time.Now())
+	if isForeignApp("84912283") {
+		t.Error("a disagreeing observation left the mislearned app id in place")
+	}
+
+	// Casting resumes, and the next agreeing poll settles on the right id.
+	setCastState(dev, true)
+	observeCastState(dev, true, "84912283", time.Now())
+	if isForeignApp("84912283") {
+		t.Error("our own app still reported as foreign after re-learning")
+	}
+	if !isForeignApp("CA5E9605") {
+		t.Error("the interloper's app should now be the foreign one")
+	}
+}
+
+// A dropped observation is not evidence of anything. Reporting the app a stale
+// probe saw made the monitor "take back" a device that was already showing our
+// dashboard.
+func TestStaleObservationIsReportedAsNotApplied(t *testing.T) {
+	resetCastState()
+	dev := DeviceConfig{Name: "Lounge", Host: "1.2.3.4"}
+
+	probeStarted := time.Now().Add(-time.Second)
+	setCastState(dev, true)
+	if observeCastState(dev, true, "CA5E9605", probeStarted) {
+		t.Error("an observation predating our cast should report as not applied")
+	}
+	if !observeCastState(dev, true, "84912283", time.Now()) {
+		t.Error("a fresh observation should report as applied")
 	}
 }
 

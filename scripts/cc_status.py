@@ -119,7 +119,12 @@ def main():
         emit({"error": message, "detail": traceback.format_exc()})
         sys.exit(1)
     finally:
-        watchdog.cancel()
+        # disconnect() first, watchdog.cancel() after. Cancelling first left the
+        # riskiest call in the script — the one the watchdog exists for — running
+        # with no backstop: a disconnect that ignores its own timeout then hung
+        # until the caller's 15s context killed us, holding a subprocess open for
+        # every poll. The payload is already flushed by now, so the watchdog
+        # firing here costs nothing; emit() drops its second object.
         if cast:
             try:
                 # Bounded: an unreachable device leaves the socket client in a
@@ -128,6 +133,7 @@ def main():
                 cast.disconnect(timeout=DISCONNECT_TIMEOUT)
             except Exception:
                 pass
+        watchdog.cancel()
 
 
 if __name__ == "__main__":

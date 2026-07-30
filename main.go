@@ -94,6 +94,19 @@ var (
 	// One value for all devices, not one per device: it is a property of catt,
 	// so the first auto-cast after a restart re-learns it for the whole fleet.
 	learnedCastApp string
+	// castAppCandidate is an app id seen once after a cast of ours but not yet
+	// trusted. Two separate casts must agree before it becomes learnedCastApp.
+	//
+	// One observation is not enough. The learn flag is claimed by whatever the
+	// first poll after our cast finds running, and that poll is a whole check
+	// interval later — anybody who starts their own app in that gap gets recorded
+	// as us. Acting on a single sighting made that mistake permanent: the value
+	// is fleet-wide, so the real dashboard then read as foreign on every device,
+	// a device without takeover was never cast again, and with no further casts
+	// there was no later observation that could correct it. Requiring agreement
+	// makes a wrong sighting self-healing instead — it clears the trusted value,
+	// casting resumes, and the next cast's poll disagrees and re-candidates.
+	castAppCandidate string
 	// castLearnPending marks devices we have just cast to and whose next
 	// non-idle poll therefore identifies that app.
 	castLearnPending = map[string]bool{}
@@ -142,24 +155,35 @@ func setCastState(dev DeviceConfig, playing bool) {
 // observedAt is when the poll *began*, not when it finished: a probe takes
 // seconds, so one started before a cast can land after it and would otherwise
 // overwrite the newer truth with what it saw beforehand.
-func observeCastState(dev DeviceConfig, playing bool, appID string, observedAt time.Time) {
+//
+// Reports whether the observation was applied. A caller must not draw any other
+// conclusion from a poll we dropped — see getPychromecastStatus.
+func observeCastState(dev DeviceConfig, playing bool, appID string, observedAt time.Time) bool {
 	k := deviceKey(dev)
 	castStatesMu.Lock()
 	defer castStatesMu.Unlock()
 	if acted, ok := castActions[k]; ok && observedAt.Before(acted) {
-		return // this poll predates the cast/stop it would be overwriting
+		return false // this poll predates the cast/stop it would be overwriting
 	}
 	if playing && appID != "" && castLearnPending[k] {
-		// Overwrite rather than keep the first value ever seen: if someone cast
-		// to the device in the gap between our cast and this poll we learn the
-		// wrong app, and only a later cast can correct it.
-		learnedCastApp = appID
+		if castAppCandidate == appID {
+			learnedCastApp = appID
+		} else {
+			// Disagreement, so this is a first sighting: hold it as a candidate
+			// and trust nothing until a second cast confirms it. Clearing the
+			// trusted value matters as much as not setting one — if the stored id
+			// was the mistake, dropping it lets casting resume, which is the only
+			// thing that can produce the observation that corrects it.
+			castAppCandidate = appID
+			learnedCastApp = ""
+		}
 		delete(castLearnPending, k)
 	}
 	castStates[k] = playing
 	if playing {
 		delete(castErrors, k)
 	}
+	return true
 }
 
 // isForeignApp reports whether appID is something other than our own cast.
@@ -466,10 +490,16 @@ func getPychromecastStatus(ctx context.Context, dev DeviceConfig) DeviceStatus {
 		if ds.State == "" {
 			ds.State = "Playing"
 		}
-		observeCastState(dev, true, result.AppID, observedAt)
 		// After observing, so a poll that has just taught us the app id does not
-		// then report that same app as somebody else's.
-		ds.Foreign = isForeignApp(result.AppID)
+		// then report that same app as somebody else's. And only when the
+		// observation was actually applied: a probe that started before our cast
+		// landed is reporting the app that was running *beforehand*, and calling
+		// that foreign made the monitor "take back" a device already showing our
+		// dashboard — a second, wasted cast, which is the very thing the
+		// staleness check exists to prevent.
+		if observeCastState(dev, true, result.AppID, observedAt) {
+			ds.Foreign = isForeignApp(result.AppID)
+		}
 	}
 	return ds
 }
@@ -648,8 +678,12 @@ func parseCattScan(out string) []DiscoveredDevice {
 			continue
 		}
 		name := rest
-		if before, _, ok := strings.Cut(rest, " - "); ok {
-			name = before // trailing " - <manufacturer> <model>"
+		// Split at the *last* separator, not the first: a friendly name may
+		// itself contain " - " ("Kitchen - Nest Hub"), and cutting at the first
+		// one truncated it to "Kitchen". catt is then asked to cast to a device
+		// that does not exist under that name.
+		if i := strings.LastIndex(rest, " - "); i != -1 {
+			name = rest[:i] // trailing " - <manufacturer> <model>"
 		}
 		if name = strings.TrimSpace(name); name != "" {
 			devices = append(devices, DiscoveredDevice{Name: name, Host: strings.TrimSpace(host)})
@@ -815,10 +849,18 @@ func tcpScan(ctx context.Context, subnets []string, onStatus func(string), onFou
 		mu      sync.Mutex
 		wg      sync.WaitGroup
 		sem     = make(chan struct{}, 50)
-		client  = &http.Client{Timeout: 2 * time.Second}
+		// Its own transport, not the default one: with Transport nil these
+		// requests go through http.DefaultTransport, so a scan's connections land
+		// in the process-wide idle pool and CloseIdleConnections below reaches
+		// into it. Keep-alives off because we make exactly one request per host,
+		// so a pooled connection is only ever waste.
+		client = &http.Client{
+			Timeout:   2 * time.Second,
+			Transport: &http.Transport{DisableKeepAlives: true},
+		}
 	)
 	// A scan can open a connection to every responding host; without this they
-	// sit in the shared idle pool until their keep-alive expires.
+	// sit in the idle pool until their keep-alive expires.
 	defer client.CloseIdleConnections()
 
 	// Ticker goroutine for progress events; stopped before tcpScan returns.
