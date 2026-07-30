@@ -67,7 +67,7 @@
               <div class="flex items-center gap-3">
                 <div class="w-2 h-2 rounded-full flex-shrink-0"
                      :class="(s => ({
-                       'bg-emerald-400': s && !['idle','unknown',''].includes(s),
+                       'bg-emerald-400': s && s !== 'buffering' && !['idle','unknown',''].includes(s),
                        'bg-yellow-400 animate-pulse': s === 'buffering',
                        'bg-slate-500': !s || ['idle','unknown',''].includes(s),
                      }))(statusFor(device.name)?.state?.toLowerCase())">
@@ -189,15 +189,15 @@
       <!-- Live diagnostics -->
       <div x-show="scanStatus" class="mb-4 bg-slate-800 border border-slate-700 rounded-xl p-4 space-y-3">
         <p class="text-slate-300 text-sm font-mono" x-text="scanStatus"></p>
-        <template x-if="scanProgress">
+        <template x-if="scanProgress && scanProgress.total > 0">
           <div>
             <div class="flex justify-between text-xs text-slate-500 mb-1.5">
               <span x-text="scanProgress.checked + ' / ' + scanProgress.total + ' hosts checked'"></span>
-              <span x-text="Math.round(scanProgress.checked / scanProgress.total * 100) + '%'"></span>
+              <span x-text="scanPercent() + '%'"></span>
             </div>
             <div class="w-full bg-slate-700 rounded-full h-1.5">
               <div class="bg-blue-500 h-1.5 rounded-full transition-all duration-300"
-                   :style="'width:' + Math.round(scanProgress.checked / scanProgress.total * 100) + '%'"></div>
+                   :style="'width:' + scanPercent() + '%'"></div>
             </div>
           </div>
         </template>
@@ -216,10 +216,11 @@
               <p class="text-slate-400 text-xs mt-0.5" x-text="device.host"></p>
             </div>
             <button @click="addFromScan(device)"
-                    :disabled="isDeviceConfigured(device.name)"
+                    :disabled="scanAddState(device.name) === 'added'"
                     class="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 disabled:bg-slate-700 disabled:text-slate-400 rounded-lg text-xs font-medium transition-colors">
-              <span x-show="!isDeviceConfigured(device.name)">Add to Config</span>
-              <span x-show="isDeviceConfigured(device.name)">Added</span>
+              <span x-show="scanAddState(device.name) === 'add'">Add to Config</span>
+              <span x-show="scanAddState(device.name) === 'set-ip'">Set IP</span>
+              <span x-show="scanAddState(device.name) === 'added'">Added</span>
             </button>
           </div>
         </template>
@@ -238,6 +239,7 @@
         scanning: false,
         saving: false,
         notification: null,
+        _notifyTimer: null,
         lastRefresh: '',
         scanStatus: '',
         scanProgress: null,
@@ -307,6 +309,11 @@
           return this.statuses.find(s => s.name === name)
         },
 
+        scanPercent() {
+          if (!this.scanProgress || !this.scanProgress.total) return 0
+          return Math.round(this.scanProgress.checked / this.scanProgress.total * 100)
+        },
+
         scan() {
           if (this.scanning) return
           this.scanning = true
@@ -320,7 +327,12 @@
           const es = new EventSource(url)
 
           es.onmessage = (e) => {
-            const evt = JSON.parse(e.data)
+            let evt
+            try {
+              evt = JSON.parse(e.data)
+            } catch {
+              return // ignore a malformed frame rather than wedging scanning=true
+            }
             switch (evt.type) {
               case 'status':
                 this.scanStatus = evt.message
@@ -356,65 +368,93 @@
           return this.config.devices.some(d => d.name === name)
         },
 
+        scanAddState(name) {
+          const existing = this.config.devices.find(d => d.name === name)
+          if (!existing) return 'add'
+          return existing.host ? 'added' : 'set-ip'
+        },
+
         addFromScan(discovered) {
-          if (!this.isDeviceConfigured(discovered.name)) {
-            this.config.devices.push({ name: discovered.name, host: discovered.host, url: '', auto_cast: false })
-            this.notify(`Added "${discovered.name}" — save config to persist`, 'success')
+          const existing = this.config.devices.find(d => d.name === discovered.name)
+          if (existing) {
+            // Already configured but with no IP (e.g. added manually) — fill it
+            // in rather than silently doing nothing.
+            if (!existing.host) {
+              existing.host = discovered.host
+              this.notify(`Set IP for "${discovered.name}" — save config to persist`, 'success')
+            }
+            return
           }
+          this.config.devices.push({ name: discovered.name, host: discovered.host, url: '', auto_cast: false })
+          this.notify(`Added "${discovered.name}" — save config to persist`, 'success')
         },
 
         addDeviceManually() {
-          this.config.devices.push({ name: '', url: '', auto_cast: false })
+          this.config.devices.push({ name: '', host: '', url: '', auto_cast: false })
         },
 
-        async castDevice(device) {
+        // notifyResult: skip per-device toasts during Cast All / Stop All so the
+        // caller can report one summary instead.
+        async castDevice(device, notifyResult = true) {
           const url = device.url || this.config.default_url
           if (!url) {
-            this.notify('No URL set for this device (and no default URL)', 'error')
-            return
+            this.notify(`No URL set for "${device.name || 'unnamed device'}" (and no default URL)`, 'error')
+            return false
           }
           try {
-            await fetch('/api/devices/cast', {
+            const res = await fetch('/api/devices/cast', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ name: device.name, host: device.host || '', url }),
             })
-            this.notify(`Casting to "${device.name}"`, 'success')
+            if (!res.ok) throw new Error(await res.text())
+            if (notifyResult) this.notify(`Casting to "${device.name}"`, 'success')
             setTimeout(() => this.refreshStatuses(), 5000)
+            return true
           } catch (e) {
             this.notify('Cast error: ' + e.message, 'error')
+            return false
           }
         },
 
-        async stopDevice(device) {
+        async stopDevice(device, notifyResult = true) {
           try {
-            await fetch('/api/devices/stop', {
+            const res = await fetch('/api/devices/stop', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ name: device.name, host: device.host || '' }),
             })
-            this.notify(`Stopped "${device.name}"`, 'success')
+            if (!res.ok) throw new Error(await res.text())
+            if (notifyResult) this.notify(`Stopped "${device.name}"`, 'success')
             setTimeout(() => this.refreshStatuses(), 3000)
+            return true
           } catch (e) {
             this.notify('Stop error: ' + e.message, 'error')
+            return false
           }
         },
 
         async castAll() {
-          for (const device of this.config.devices) {
-            await this.castDevice(device)
-          }
+          const results = await Promise.all(
+            this.config.devices.map(d => this.castDevice(d, false)))
+          const n = results.filter(Boolean).length
+          this.notify(`Casting to ${n} of ${results.length} devices`, n ? 'success' : 'error')
         },
 
         async stopAll() {
-          for (const device of this.config.devices) {
-            await this.stopDevice(device)
-          }
+          const results = await Promise.all(
+            this.config.devices.map(d => this.stopDevice(d, false)))
+          const n = results.filter(Boolean).length
+          this.notify(`Stopped ${n} of ${results.length} devices`, n ? 'success' : 'error')
         },
 
         notify(msg, type = 'success') {
           this.notification = { msg, type }
-          setTimeout(() => this.notification = null, 3500)
+          // Reset the timer on each notification — otherwise an earlier toast's
+          // pending timeout clears a newer one after only a fraction of its life
+          // (very visible during Cast All / Stop All).
+          clearTimeout(this._notifyTimer)
+          this._notifyTimer = setTimeout(() => this.notification = null, 3500)
         },
       }
     }

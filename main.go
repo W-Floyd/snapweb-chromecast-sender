@@ -11,11 +11,16 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+// minCheckInterval is the shortest monitor interval we honour, matching the
+// UI's min attribute.
+const minCheckInterval = 10
 
 type DeviceConfig struct {
 	Name     string `json:"name"`
@@ -43,9 +48,11 @@ type DiscoveredDevice struct {
 }
 
 var (
-	cfg     Config
-	cfgMu   sync.RWMutex
-	cfgPath = "/config/config.json"
+	cfg          Config
+	cfgMu        sync.RWMutex
+	cfgPath      = "/config/config.json"
+	staticDir    = "/static"
+	statusScript = "/usr/local/lib/chromecast/cc_status.py"
 
 	// castStates tracks devices we have actively cast to.
 	// catt gives no signal for web-page cast state, so we track it ourselves.
@@ -66,22 +73,29 @@ func isCasting(name string) bool {
 }
 
 func loadConfig() {
+	cfgMu.Lock()
+	defer cfgMu.Unlock()
+
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			log.Printf("config read error: %v", err)
 		}
-		cfg = Config{CheckInterval: 60}
+		cfg = Config{CheckInterval: 60, Devices: []DeviceConfig{}}
 		return
 	}
-	cfgMu.Lock()
-	defer cfgMu.Unlock()
-	if err := json.Unmarshal(data, &cfg); err != nil {
+	// Unmarshal into a scratch value so a malformed file cannot leave cfg
+	// half-populated with a mix of defaults and file contents.
+	loaded := Config{CheckInterval: 60}
+	if err := json.Unmarshal(data, &loaded); err != nil {
 		log.Printf("config parse error: %v", err)
+		cfg = Config{CheckInterval: 60, Devices: []DeviceConfig{}}
+		return
 	}
-	if cfg.Devices == nil {
-		cfg.Devices = []DeviceConfig{}
+	if loaded.Devices == nil {
+		loaded.Devices = []DeviceConfig{}
 	}
+	cfg = loaded
 }
 
 func saveConfig() error {
@@ -91,11 +105,22 @@ func saveConfig() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(cfgPath, data, 0644)
+	// Write to a temp file and rename so a crash mid-write cannot truncate
+	// the existing config.
+	tmp := cfgPath + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, cfgPath); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // cattDeviceArgs returns the catt flags to target a specific device.
-// Uses --host <ip> when available (bypasses mDNS), otherwise -d <name>.
+// catt's -d accepts either a friendly name or an IP; passing the IP when we
+// have one bypasses mDNS resolution.
 func cattDeviceArgs(dev DeviceConfig) []string {
 	if dev.Host != "" {
 		return []string{"-d", dev.Host}
@@ -144,7 +169,7 @@ func getPychromecastStatus(dev DeviceConfig) DeviceStatus {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	// CombinedOutput so any Python tracebacks appear in ds.Error
-	out, _ := exec.CommandContext(ctx, "python3", "/usr/local/lib/chromecast/cc_status.py", dev.Host).CombinedOutput()
+	out, _ := exec.CommandContext(ctx, "python3", statusScript, dev.Host).CombinedOutput()
 	var result struct {
 		DisplayName string `json:"display_name"`
 		IsIdle      bool   `json:"is_idle"`
@@ -173,14 +198,9 @@ func getPychromecastStatus(dev DeviceConfig) DeviceStatus {
 
 func monitorDevices() {
 	cfgMu.RLock()
-	interval := cfg.CheckInterval
 	devices := append([]DeviceConfig{}, cfg.Devices...)
 	defaultURL := cfg.DefaultURL
 	cfgMu.RUnlock()
-
-	if interval <= 0 {
-		interval = 60
-	}
 
 	for _, dev := range devices {
 		if !dev.AutoCast {
@@ -192,6 +212,13 @@ func monitorDevices() {
 		}
 		if url == "" {
 			continue
+		}
+		// Poll the device itself when we can. Relying on the cached cast state
+		// alone means a device that drops the cast (reboot, someone else casts
+		// to it) is never recovered, because nothing clears the flag unless a
+		// browser happens to be polling /api/devices/status.
+		if dev.Host != "" {
+			getPychromecastStatus(dev)
 		}
 		if isCasting(dev.Name) {
 			continue
@@ -215,6 +242,11 @@ func monitorLoop() {
 		cfgMu.RUnlock()
 		if interval <= 0 {
 			interval = 60
+		}
+		// Floor the interval: a small or hand-edited value would otherwise
+		// hammer every device with status queries in a near-hot loop.
+		if interval < minCheckInterval {
+			interval = minCheckInterval
 		}
 		time.Sleep(time.Duration(interval) * time.Second)
 	}
@@ -276,6 +308,7 @@ func cattScan() []DiscoveredDevice {
 func localSubnets() []string {
 	ifaces, _ := net.Interfaces()
 	var subnets []string
+	seen := map[string]bool{}
 	for _, iface := range ifaces {
 		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
 			continue
@@ -292,9 +325,16 @@ func localSubnets() []string {
 			if ip == nil || ip.To4() == nil {
 				continue
 			}
-			parts := strings.Split(ip.String(), ".")
+			parts := strings.Split(ip.To4().String(), ".")
 			if len(parts) == 4 {
-				subnets = append(subnets, strings.Join(parts[:3], "."))
+				// Multiple interfaces / aliases can share a /24. Deduplicate,
+				// or the TCP scan probes every host twice and reports a
+				// doubled host total.
+				base := strings.Join(parts[:3], ".")
+				if !seen[base] {
+					seen[base] = true
+					subnets = append(subnets, base)
+				}
 			}
 		}
 	}
@@ -310,10 +350,9 @@ type ScanEvent struct {
 	Count   int               `json:"count"`
 }
 
-// parseSubnet accepts "192.168.1", "192.168.1.0/24", or "192.168.1.x" and
-// returns the three-octet base ("192.168.1"), or "" if unparseable.
 // parseSubnet accepts any of: "192.168.1", "192.168.1.0/24", "192.168.1.x",
-// or any host address in the subnet, and returns the three-octet base ("192.168.1").
+// "192.168.1.*", or any host address in the subnet, and returns the
+// three-octet base ("192.168.1"), or "" if unparseable.
 func parseSubnet(s string) string {
 	s = strings.TrimSpace(s)
 	if idx := strings.Index(s, "/"); idx != -1 {
@@ -325,10 +364,19 @@ func parseSubnet(s string) string {
 			return strings.Join(parts[:3], ".")
 		}
 	}
-	// Accept bare three-octet base like "192.168.1"
 	parts := strings.Split(s, ".")
-	if len(parts) == 3 && parts[0] != "" && parts[1] != "" && parts[2] != "" {
-		return s
+	// Accept a wildcard last octet: "192.168.1.x" / "192.168.1.*"
+	if len(parts) == 4 && (parts[3] == "x" || parts[3] == "X" || parts[3] == "*") {
+		parts = parts[:3]
+	}
+	// Accept a bare three-octet base like "192.168.1"
+	if len(parts) == 3 {
+		for _, p := range parts {
+			if n, err := strconv.Atoi(p); err != nil || n < 0 || n > 255 {
+				return ""
+			}
+		}
+		return strings.Join(parts, ".")
 	}
 	return ""
 }
@@ -336,12 +384,9 @@ func parseSubnet(s string) string {
 func handleSubnets(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	bases := localSubnets()
-	cidrs := make([]string, len(bases))
+	cidrs := make([]string, len(bases)) // non-nil, so it marshals as [] not null
 	for i, b := range bases {
 		cidrs[i] = b + ".0/24"
-	}
-	if cidrs == nil {
-		cidrs = []string{}
 	}
 	json.NewEncoder(w).Encode(cidrs)
 }
@@ -351,7 +396,7 @@ func handleSubnets(w http.ResponseWriter, r *http.Request) {
 // onStatus receives human-readable status lines (including subnet info).
 // onFound is called immediately when a device is confirmed.
 // onProgress is called every ~500ms with (checked, total) counts.
-func tcpScan(subnets []string, onStatus func(string), onFound func(DiscoveredDevice), onProgress func(int, int)) []DiscoveredDevice {
+func tcpScan(ctx context.Context, subnets []string, onStatus func(string), onFound func(DiscoveredDevice), onProgress func(int, int)) []DiscoveredDevice {
 	if len(subnets) == 0 {
 		subnets = localSubnets()
 	}
@@ -404,13 +449,23 @@ func tcpScan(subnets []string, onStatus func(string), onFound func(DiscoveredDev
 				defer func() { <-sem }()
 				defer atomic.AddInt64(&checked, 1)
 
+				// Bail out cheaply once the client has disconnected, instead of
+				// probing the remaining hosts with nobody listening.
+				if ctx.Err() != nil {
+					return
+				}
+
 				conn, err := net.DialTimeout("tcp", h+":8008", 400*time.Millisecond)
 				if err != nil {
 					return
 				}
 				conn.Close()
 
-				resp, err := client.Get("http://" + h + ":8008/setup/eureka_info")
+				req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+h+":8008/setup/eureka_info", nil)
+				if err != nil {
+					return
+				}
+				resp, err := client.Do(req)
 				if err != nil {
 					return
 				}
@@ -435,6 +490,10 @@ func tcpScan(subnets []string, onStatus func(string), onFound func(DiscoveredDev
 	wg.Wait()
 	close(stopTicker)
 	tickerWg.Wait()
+	// The ticker fires on a 500ms cadence, so the last emitted progress event is
+	// almost always short of the total — leaving the UI progress bar stuck below
+	// 100%. Emit one final event now that every host has been checked.
+	onProgress(int(atomic.LoadInt64(&checked)), total)
 	return devices
 }
 
@@ -449,8 +508,13 @@ func handleScan(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 
+	ctx := r.Context()
+
 	var writeMu sync.Mutex
 	send := func(evt ScanEvent) {
+		if ctx.Err() != nil {
+			return // client gone; writing to w is no longer valid
+		}
 		data, _ := json.Marshal(evt)
 		writeMu.Lock()
 		fmt.Fprintf(w, "data: %s\n\n", data)
@@ -486,6 +550,7 @@ func handleScan(w http.ResponseWriter, r *http.Request) {
 	}
 
 	devices = tcpScan(
+		ctx,
 		explicitSubnets,
 		func(msg string) { send(ScanEvent{Type: "status", Message: msg}) },
 		func(d DiscoveredDevice) { send(ScanEvent{Type: "found", Device: &d}) },
@@ -585,6 +650,12 @@ func main() {
 	if p := os.Getenv("CONFIG_PATH"); p != "" {
 		cfgPath = p
 	}
+	if p := os.Getenv("STATIC_DIR"); p != "" {
+		staticDir = p
+	}
+	if p := os.Getenv("STATUS_SCRIPT"); p != "" {
+		statusScript = p
+	}
 	if err := os.MkdirAll(filepath.Dir(cfgPath), 0755); err != nil {
 		log.Printf("warning: could not create config dir: %v", err)
 	}
@@ -598,12 +669,19 @@ func main() {
 	mux.HandleFunc("/api/devices/status", handleDeviceStatus)
 	mux.HandleFunc("/api/devices/cast", handleCast)
 	mux.HandleFunc("/api/devices/stop", handleStop)
-	mux.Handle("/", http.FileServer(http.Dir("/static")))
+	mux.Handle("/", http.FileServer(http.Dir(staticDir)))
 
 	port := "8080"
 	if p := os.Getenv("PORT"); p != "" {
 		port = p
 	}
+	// No WriteTimeout: /api/devices/scan is a long-lived SSE stream and a write
+	// deadline would kill it mid-scan.
+	srv := &http.Server{
+		Addr:              ":" + port,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
 	log.Printf("chromecast-sender running on :%s", port)
-	log.Fatal(http.ListenAndServe(":"+port, mux))
+	log.Fatal(srv.ListenAndServe())
 }

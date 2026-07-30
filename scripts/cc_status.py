@@ -20,16 +20,22 @@ def main():
 
         cast.wait(timeout=10)
         s = cast.status
+        if s is None:
+            print(json.dumps({"error": "no status received from %s" % host}))
+            sys.exit(1)
 
         app_id = s.app_id
         display_name = (s.display_name or "").strip()
-        is_idle = s.is_stand_by or app_id is None or app_id == BACKDROP_APP_ID
+        is_idle = bool(s.is_stand_by) or app_id is None or app_id == BACKDROP_APP_ID
+
+        # volume_level/volume_muted are None until the first status update lands.
+        volume_level = round(s.volume_level, 2) if s.volume_level is not None else None
 
         print(json.dumps({
             "app_id": app_id,
             "display_name": display_name,
             "is_idle": is_idle,
-            "volume_level": round(s.volume_level, 2),
+            "volume_level": volume_level,
             "volume_muted": s.volume_muted,
         }))
 

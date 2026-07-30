@@ -1,2 +1,3 @@
 chromecast-sender
 config/
+__pycache__/
