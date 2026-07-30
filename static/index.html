@@ -15,7 +15,7 @@
   <!-- Notification toast -->
   <div x-show="notification" x-transition
        :class="notification?.type === 'error' ? 'bg-red-600' : 'bg-emerald-600'"
-       class="fixed top-4 right-4 z-50 px-4 py-2.5 rounded-lg shadow-xl text-white font-medium text-sm"
+       class="fixed top-4 right-4 z-50 max-w-sm px-4 py-2.5 rounded-lg shadow-xl text-white font-medium text-sm break-words"
        x-text="notification?.msg">
   </div>
 
@@ -471,12 +471,15 @@
         },
 
         // notifyResult: skip per-device toasts during Cast All / Stop All so the
-        // caller can report one summary instead.
+        // caller can report one summary instead. Both return { ok, error } rather
+        // than a boolean — the reason has to survive back to the caller, because
+        // during a batch there is only one toast and it is the summary.
         async castDevice(device, notifyResult = true) {
           const url = device.url || this.config.default_url
           if (!url) {
-            this.notify(`No URL set for "${device.name || 'unnamed device'}" (and no default URL)`, 'error')
-            return false
+            const error = `no URL set for "${device.name || 'unnamed device'}" (and no default URL)`
+            if (notifyResult) this.notify(error, 'error')
+            return { ok: false, error }
           }
           try {
             const res = await fetch('/api/devices/cast', {
@@ -487,10 +490,10 @@
             if (!res.ok) throw new Error(await res.text())
             if (notifyResult) this.notify(`Casting to "${device.name}"`, 'success')
             setTimeout(() => this.refreshStatuses(), 5000)
-            return true
+            return { ok: true }
           } catch (e) {
-            this.notify('Cast error: ' + e.message, 'error')
-            return false
+            if (notifyResult) this.notify('Cast error: ' + e.message, 'error')
+            return { ok: false, error: e.message }
           }
         },
 
@@ -504,25 +507,36 @@
             if (!res.ok) throw new Error(await res.text())
             if (notifyResult) this.notify(`Stopped "${device.name}"`, 'success')
             setTimeout(() => this.refreshStatuses(), 3000)
-            return true
+            return { ok: true }
           } catch (e) {
-            this.notify('Stop error: ' + e.message, 'error')
-            return false
+            if (notifyResult) this.notify('Stop error: ' + e.message, 'error')
+            return { ok: false, error: e.message }
           }
+        },
+
+        // Carry the first failure's reason into the summary. Without it a batch
+        // that failed read "Casting to 0 of 3 devices" and nothing else: the
+        // per-device toasts are suppressed, and each would have overwritten the
+        // last in any case, so the explanation was lost entirely.
+        batchSummary(verb, results) {
+          const n = results.filter(r => r.ok).length
+          const failed = results.find(r => !r.ok)
+          const msg = `${verb} ${n} of ${results.length} device${results.length !== 1 ? 's' : ''}`
+          return { msg: failed ? `${msg} — ${failed.error}` : msg, ok: n > 0 }
         },
 
         async castAll() {
           const results = await Promise.all(
             this.config.devices.map(d => this.castDevice(d, false)))
-          const n = results.filter(Boolean).length
-          this.notify(`Casting to ${n} of ${results.length} devices`, n ? 'success' : 'error')
+          const { msg, ok } = this.batchSummary('Casting to', results)
+          this.notify(msg, ok ? 'success' : 'error')
         },
 
         async stopAll() {
           const results = await Promise.all(
             this.config.devices.map(d => this.stopDevice(d, false)))
-          const n = results.filter(Boolean).length
-          this.notify(`Stopped ${n} of ${results.length} devices`, n ? 'success' : 'error')
+          const { msg, ok } = this.batchSummary('Stopped', results)
+          this.notify(msg, ok ? 'success' : 'error')
         },
 
         notify(msg, type = 'success') {

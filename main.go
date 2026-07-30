@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,11 +25,11 @@ import (
 const minCheckInterval = 10
 
 // maxCheckInterval (a day) is the longest interval we honour. The ceiling is not
-// cosmetic: monitorLoop sleeps for `time.Duration(interval) * time.Second`, and
-// past ~9.2e9 seconds that multiplication overflows int64 and wraps negative.
-// time.Sleep returns immediately on a negative duration, so a fat-fingered paste
-// in the interval box turned the monitor into a hot loop that re-probed and
-// re-cast every device continuously.
+// cosmetic: checkInterval turns the value into `time.Duration(interval) *
+// time.Second`, and past ~9.2e9 seconds that multiplication overflows int64 and
+// wraps negative. A negative wait is no wait at all, so a fat-fingered paste in
+// the interval box turned the monitor into a hot loop that re-probed and re-cast
+// every device continuously.
 const maxCheckInterval = 86400
 
 type DeviceConfig struct {
@@ -95,6 +96,14 @@ var (
 	// cleared by an observation older than the failure. Observations older than
 	// the last action are stale by definition and get dropped.
 	castActions = map[string]time.Time{}
+	// castObserved records when the newest *applied* status poll began, keyed by
+	// deviceKey. castActions above only orders polls against our own casts, and
+	// polls also race each other: /api/devices/status (browser, every 30s) and the
+	// monitor loop probe the same device independently, each taking up to 15s, so
+	// the one that started earlier can easily finish later. Last-writer-wins then
+	// republished the older view — a device seen playing flipped back to "Idle"
+	// until the next tick, and the monitor could re-cast something already up.
+	castObserved = map[string]time.Time{}
 	// learnedCastApp is the receiver app id our own casts run under (catt's
 	// cast_site uses DashCast). It is learned from the first status poll after a
 	// cast we initiated rather than hardcoded: a wrong constant here would make
@@ -123,6 +132,12 @@ var (
 	// non-idle poll therefore identifies that app.
 	castLearnPending = map[string]bool{}
 	castStatesMu     sync.RWMutex
+
+	// configChanged wakes monitorLoop so it re-reads the check interval. Buffered
+	// and signalled non-blockingly: a coalesced wake-up is as good as several, and
+	// POST /api/config must never block on the monitor, which can be mid-cast and
+	// therefore tens of seconds from looking at this.
+	configChanged = make(chan struct{}, 1)
 
 	// scanInFlight serialises /api/devices/scan. A TCP scan fans out to every
 	// host on the subnet; letting impatient re-clicks stack them up multiplies
@@ -177,6 +192,10 @@ func observeCastState(dev DeviceConfig, playing bool, appID string, observedAt t
 	if acted, ok := castActions[k]; ok && observedAt.Before(acted) {
 		return false // this poll predates the cast/stop it would be overwriting
 	}
+	if prev, ok := castObserved[k]; ok && observedAt.Before(prev) {
+		return false // an overlapping poll already reported a later view
+	}
+	castObserved[k] = observedAt
 	if playing && appID != "" && castLearnPending[k] {
 		if castAppCandidate == appID {
 			learnedCastApp = appID
@@ -276,6 +295,11 @@ func pruneCastStates(devices []DeviceConfig) {
 	for k := range castActions {
 		if !keep[k] {
 			delete(castActions, k)
+		}
+	}
+	for k := range castObserved {
+		if !keep[k] {
+			delete(castObserved, k)
 		}
 	}
 	for k := range castLearnPending {
@@ -432,9 +456,46 @@ func cattFailure(err error, out string) string {
 	return shortError(err.Error())
 }
 
+// castableURL reports whether u is something catt's cast_site can be given.
+// Pure, so it is testable without catt.
+func castableURL(u string) bool {
+	parsed, err := url.Parse(u)
+	if err != nil {
+		return false
+	}
+	// Host must be present: "http:/dashboard" parses fine and is not castable.
+	return (parsed.Scheme == "http" || parsed.Scheme == "https") && parsed.Host != ""
+}
+
+// effectiveURL is the URL auto-cast would use for dev: its own, or the global
+// default when it has none. Single definition so monitorDevices and the warning
+// the UI shows cannot disagree about which one applies.
+func effectiveURL(dev DeviceConfig, defaultURL string) string {
+	if dev.URL != "" {
+		return dev.URL
+	}
+	return defaultURL
+}
+
 // configWarning reports an advisory problem with how a device is configured.
+// url is the device's effective cast URL: "nothing to cast" is a property of the
+// device and the global default together, not of the device alone.
 // Pure and free of any subprocess, so it can be tested without catt.
-func configWarning(dev DeviceConfig) string {
+func configWarning(dev DeviceConfig, url string) string {
+	if !dev.AutoCast {
+		return "" // nothing is monitoring it, so there is nothing to warn about
+	}
+	if dev.Name == "" && dev.Host == "" {
+		return "" // getLiveStatus already explains this one; do not pile on
+	}
+	// monitorDevices skips both of the next two cases, and a skip is invisible:
+	// from the UI it is indistinguishable from auto-cast simply not working.
+	if url == "" {
+		return "No URL for this device and no default URL — auto-cast has nothing to cast."
+	}
+	if !castableURL(url) {
+		return "URL is not an absolute http:// or https:// address — auto-cast cannot use it."
+	}
 	// An auto-cast device with no IP cannot be monitored at all. `catt status`
 	// reports the *media* session, and a web page cast has none, so its output is
 	// byte-identical for "showing our dashboard" and "sitting idle" — the monitor
@@ -443,13 +504,13 @@ func configWarning(dev DeviceConfig) string {
 	// from that output is not an option: guessing "idle" would re-cast every tick
 	// and restart the dashboard forever. An IP switches the device to the
 	// pychromecast helper, which does report the app id.
-	if dev.AutoCast && dev.Host == "" && dev.Name != "" {
+	if dev.Host == "" {
 		return "No IP set — auto-cast cannot tell if this device drops the cast. Scan and use 'Set IP'."
 	}
 	return ""
 }
 
-func getDeviceStatus(ctx context.Context, dev DeviceConfig) DeviceStatus {
+func getDeviceStatus(ctx context.Context, dev DeviceConfig, defaultURL string) DeviceStatus {
 	ds := getLiveStatus(ctx, dev)
 	// Surface the last failed cast/stop when the device itself has nothing to
 	// report. Otherwise a cast that failed is indistinguishable from one that
@@ -457,7 +518,7 @@ func getDeviceStatus(ctx context.Context, dev DeviceConfig) DeviceStatus {
 	if ds.Error == "" {
 		ds.Error = castError(dev)
 	}
-	ds.Warning = configWarning(dev)
+	ds.Warning = configWarning(dev, effectiveURL(dev, defaultURL))
 	return ds
 }
 
@@ -601,11 +662,17 @@ func monitorDevices(ctx context.Context) {
 		if dev.Name == "" && dev.Host == "" {
 			continue // nothing to target; see getLiveStatus
 		}
-		url := dev.URL
-		if url == "" {
-			url = defaultURL
-		}
-		if url == "" {
+		url := effectiveURL(dev, defaultURL)
+		// Both skips are reported to the UI by configWarning rather than through
+		// castErrors: they are standing configuration problems, so recording them
+		// as a fresh cast failure on every tick would keep bumping castActions and
+		// suppress every status observation of the device for good.
+		//
+		// The second is not cosmetic. catt reads a "-"-prefixed positional as a
+		// flag, and one it accepts makes it exit 0 without casting — which we would
+		// record as a success and then let the app-id learner adopt whatever is
+		// really running on the device as our own, fleet-wide.
+		if url == "" || !castableURL(url) {
 			continue
 		}
 		// Poll the device itself when we can. Relying on the cached cast state
@@ -655,24 +722,50 @@ func monitorDevices(ctx context.Context) {
 	}
 }
 
+// checkInterval reads the monitor interval as a Duration.
+func checkInterval() time.Duration {
+	cfgMu.RLock()
+	interval := cfg.CheckInterval
+	cfgMu.RUnlock()
+	// Defensive clamp: normalizeConfig already guarantees both bounds, but
+	// this is where the value becomes a Duration, and both ends of the range
+	// produce a hot loop that hammers every device with status queries — too
+	// small directly, too large by overflowing the multiplication below into a
+	// negative duration that a sleep does not wait on at all.
+	if interval < minCheckInterval {
+		interval = minCheckInterval
+	}
+	if interval > maxCheckInterval {
+		interval = maxCheckInterval
+	}
+	return time.Duration(interval) * time.Second
+}
+
 func monitorLoop() {
 	for {
 		monitorDevices(context.Background())
-		cfgMu.RLock()
-		interval := cfg.CheckInterval
-		cfgMu.RUnlock()
-		// Defensive clamp: normalizeConfig already guarantees both bounds, but
-		// this is where the value becomes a Duration, and both ends of the range
-		// produce a hot loop that hammers every device with status queries — too
-		// small directly, too large by overflowing the multiplication below into a
-		// negative duration that time.Sleep does not wait on at all.
-		if interval < minCheckInterval {
-			interval = minCheckInterval
+		waitFrom := time.Now()
+		// Re-read the interval whenever the config changes instead of sleeping on
+		// the value read once here. The ceiling is a day, so lowering the interval
+		// from anywhere near it took effect only after the *old* interval had
+		// elapsed — up to 24h during which the save looked like it had done
+		// nothing at all.
+		//
+		// The deadline is measured from waitFrom rather than from each wake-up, so
+		// repeated saves shorten the wait towards zero and can never postpone the
+		// next poll.
+		for {
+			d := time.Until(waitFrom.Add(checkInterval()))
+			if d <= 0 {
+				break
+			}
+			t := time.NewTimer(d)
+			select {
+			case <-t.C:
+			case <-configChanged:
+				t.Stop()
+			}
 		}
-		if interval > maxCheckInterval {
-			interval = maxCheckInterval
-		}
-		time.Sleep(time.Duration(interval) * time.Second)
 	}
 }
 
@@ -709,16 +802,25 @@ func handleConfig(w http.ResponseWriter, r *http.Request) {
 			cfgMu.Lock()
 			cfg = newCfg
 			cfgMu.Unlock()
+			// Devices can be renamed, re-addressed or deleted here; drop the cast
+			// state of anything that no longer exists. After the save, so a rejected
+			// write does not discard the state of devices that are still configured
+			// — and inside cfgSaveMu, or a slower concurrent POST could prune
+			// against its own older device list and delete the state of devices the
+			// published config still has, re-casting them for no reason.
+			pruneCastStates(newCfg.Devices)
 		}
 		cfgSaveMu.Unlock()
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		// Devices can be renamed, re-addressed or deleted here; drop the cast
-		// state of anything that no longer exists. After the save, so a rejected
-		// write does not discard the state of devices that are still configured.
-		pruneCastStates(newCfg.Devices)
+		// A changed interval only takes effect if the monitor stops waiting out
+		// the old one; see monitorLoop.
+		select {
+		case configChanged <- struct{}{}:
+		default:
+		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	default:
@@ -971,7 +1073,13 @@ func handleSubnets(w http.ResponseWriter, r *http.Request) {
 // onStatus receives human-readable status lines (including subnet info).
 // onFound is called immediately when a device is confirmed.
 // onProgress is called every ~500ms with (checked, total) counts.
-func tcpScan(ctx context.Context, subnets []string, onStatus func(string), onFound func(DiscoveredDevice), onProgress func(int, int)) []DiscoveredDevice {
+//
+// The second return value is a reason the scan could not run at all, for the
+// caller to put on its terminating event. It deliberately does not go out
+// through onStatus: the UI overwrites the status line when the stream ends, so
+// a reason reported that way was replaced by the generic "No devices found" and
+// never seen — the same trap handleScan's other messages document.
+func tcpScan(ctx context.Context, subnets []string, onStatus func(string), onFound func(DiscoveredDevice), onProgress func(int, int)) ([]DiscoveredDevice, string) {
 	if len(subnets) == 0 {
 		subnets = localSubnets()
 	}
@@ -979,8 +1087,7 @@ func tcpScan(ctx context.Context, subnets []string, onStatus func(string), onFou
 		// Name the private-address requirement: auto-detect declining to guess is
 		// not the same failure as having no network, and a host with only a public
 		// address needs its LAN subnet typed in rather than retried.
-		onStatus("No private IPv4 subnet detected — enter a subnet to scan")
-		return nil
+		return nil, "No private IPv4 subnet detected — enter a subnet to scan"
 	}
 
 	total := len(subnets) * 254
@@ -1083,7 +1190,7 @@ func tcpScan(ctx context.Context, subnets []string, onStatus func(string), onFou
 	// almost always short of the total — leaving the UI progress bar stuck below
 	// 100%. Emit one final event now that every host has been checked.
 	onProgress(int(atomic.LoadInt64(&checked)), total)
-	return devices
+	return devices, ""
 }
 
 func handleScan(w http.ResponseWriter, r *http.Request) {
@@ -1156,7 +1263,7 @@ func handleScan(w http.ResponseWriter, r *http.Request) {
 		send(ScanEvent{Type: "status", Message: "mDNS scan found nothing — starting TCP fallback"})
 	}
 
-	devices = tcpScan(
+	devices, failure := tcpScan(
 		ctx,
 		explicitSubnets,
 		func(msg string) { send(ScanEvent{Type: "status", Message: msg}) },
@@ -1164,13 +1271,20 @@ func handleScan(w http.ResponseWriter, r *http.Request) {
 		func(checked, total int) { send(ScanEvent{Type: "progress", Checked: checked, Total: total}) },
 	)
 
-	send(ScanEvent{Type: "done", Count: len(devices)})
+	send(ScanEvent{Type: "done", Count: len(devices), Message: failure})
 }
 
 func handleDeviceStatus(w http.ResponseWriter, r *http.Request) {
+	// Read-only, but not cheap: it fans out a subprocess per configured device.
+	// Reject other methods rather than let, say, a stray POST spend 15s per device.
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	cfgMu.RLock()
 	devices := append([]DeviceConfig{}, cfg.Devices...)
+	defaultURL := cfg.DefaultURL
 	cfgMu.RUnlock()
 
 	// Index-assigned rather than appended: append order is whichever device
@@ -1181,7 +1295,7 @@ func handleDeviceStatus(w http.ResponseWriter, r *http.Request) {
 		wg.Add(1)
 		go func(i int, d DeviceConfig) {
 			defer wg.Done()
-			statuses[i] = getDeviceStatus(r.Context(), d)
+			statuses[i] = getDeviceStatus(r.Context(), d, defaultURL)
 		}(i, dev)
 	}
 	wg.Wait()
@@ -1217,6 +1331,17 @@ func handleCast(w http.ResponseWriter, r *http.Request) {
 	// Cast button fail with a 400 on exactly the devices the monitor handles best.
 	if (req.Name == "" && req.Host == "") || req.URL == "" {
 		http.Error(w, "name or host, and url, required", http.StatusBadRequest)
+		return
+	}
+	// Reject anything that is not an http(s) URL before handing it to catt as a
+	// positional argument. A value starting with "-" is read by catt's argument
+	// parser as a flag, and one it happens to accept ("--version") makes catt
+	// exit 0 without casting anything — which we then record as a *successful*
+	// cast, arming the app-id learner to adopt whatever is actually running on
+	// the device as our own. That mislearning is fleet-wide (see learnedCastApp),
+	// so a single bad request is worth more than the confusing failure it saves.
+	if !castableURL(req.URL) {
+		http.Error(w, "url must be an absolute http:// or https:// URL", http.StatusBadRequest)
 		return
 	}
 	go func() {

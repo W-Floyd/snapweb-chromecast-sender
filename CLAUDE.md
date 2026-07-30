@@ -106,6 +106,14 @@ guessing "idle" would re-cast every tick and restart the dashboard forever. Don'
 on that path; an `auto_cast` device with no IP gets a `Warning` from `configWarning`
 instead, because the monitor genuinely cannot watch it.
 
+`configWarning` is where *every* silent `continue` in `monitorDevices` gets explained.
+A skipped device is invisible — its card reads a plain "Idle" and looks identical to
+one auto-cast is happily managing — so a new skip condition needs a warning alongside
+it. It takes the *effective* URL (`effectiveURL`), not just the device, because "no URL
+and no default" is a property of the pair. Warnings, not `castErrors`: a standing
+config problem recorded as a fresh cast failure every tick would keep bumping
+`castActions` and suppress every status observation of that device for good.
+
 The full set of labels `catt status` can print is `Title:`, `Time:`, `Remaining time:`,
 `State:`, `Volume:` and `Volume muted:` — so `getLiveStatus` parses `State: ` and
 nothing else. It once also looked for a `Content: ` line, which catt has never emitted;
@@ -126,7 +134,18 @@ A status poll takes seconds, so one that started before a cast can land after it
 `castActions` timestamps our own casts and `observeCastState` drops any
 observation older than that — without it the poll's stale view overwrote the
 newer truth, which both erased fresh cast errors and re-cast devices that were
-already playing.
+already playing. `castObserved` does the same for polls against *each other*:
+`/api/devices/status` and the monitor probe the same device independently, so
+whichever started earlier can easily finish later. Any new timestamped state
+belongs in `pruneCastStates` and in `resetCastState` in the tests.
+
+**The monitor does not just sleep the interval.** `monitorLoop` waits on a timer
+that `POST /api/config` interrupts through `configChanged`, and re-reads
+`checkInterval()` each time round. The interval ceiling is a day, so a plain sleep
+on the value read at the top of the cycle applied a *lowered* interval up to 24h
+late and the save looked like it had done nothing. The deadline stays measured from
+the start of the wait, so a burst of saves can only shorten it, never postpone the
+next poll.
 
 **A cast is reported before it happens.** `/api/devices/cast` and `/stop` answer
 immediately and run `catt` in a goroutine, so failures can't ride on the HTTP response.
@@ -158,8 +177,10 @@ fallback — and streams progress over SSE. Four things to know:
   re-clicks would multiply the load for no extra coverage.
 - **The SSE stream has its own rules.** `ScanEvent.Checked`/`Total` must not get
   `omitempty` (a zero renders as `undefined / 254 hosts`); errors ride on `done` rather
-  than a preceding `status` (the UI overwrites `scanStatus` when the stream ends); and
-  the server sets no `WriteTimeout`, which would kill the stream mid-scan.
+  than a preceding `status` (the UI overwrites `scanStatus` when the stream ends —
+  which is why `tcpScan` *returns* its give-up reason instead of sending it through
+  `onStatus`); and the server sets no `WriteTimeout`, which would kill the stream
+  mid-scan.
 
 ## Conventions
 

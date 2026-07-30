@@ -260,6 +260,7 @@ func resetCastState() {
 	castStatesMu.Lock()
 	castStates, castErrors = map[string]bool{}, map[string]string{}
 	castActions = map[string]time.Time{}
+	castObserved = map[string]time.Time{}
 	castLearnPending = map[string]bool{}
 	learnedCastApp, castAppCandidate = "", ""
 	castStatesMu.Unlock()
@@ -465,32 +466,192 @@ func TestUnaddressedDeviceIsNotProbed(t *testing.T) {
 // dashboard is up" and "idle". The monitor therefore never notices a dropped
 // cast and silently stops re-casting, so the card has to say so.
 func TestAutoCastWithoutIPIsFlagged(t *testing.T) {
-	if configWarning(DeviceConfig{Name: "Lounge", AutoCast: true}) == "" {
+	const ok = "http://dash/"
+	if configWarning(DeviceConfig{Name: "Lounge", AutoCast: true}, ok) == "" {
 		t.Error("an auto-cast device with no IP should be flagged")
 	}
 	// An IP switches it to the pychromecast helper, which reports the app id.
-	if got := configWarning(DeviceConfig{Name: "Lounge", Host: "1.2.3.4", AutoCast: true}); got != "" {
+	if got := configWarning(DeviceConfig{Name: "Lounge", Host: "1.2.3.4", AutoCast: true}, ok); got != "" {
 		t.Errorf("a device with an IP needs no warning, got %q", got)
 	}
 	// Nothing is monitoring it, so there is nothing to warn about.
-	if got := configWarning(DeviceConfig{Name: "Lounge"}); got != "" {
+	if got := configWarning(DeviceConfig{Name: "Lounge"}, ""); got != "" {
 		t.Errorf("a manual-only device needs no warning, got %q", got)
 	}
 	// getLiveStatus already explains this one; do not pile a second line on it.
-	if got := configWarning(DeviceConfig{AutoCast: true}); got != "" {
+	if got := configWarning(DeviceConfig{AutoCast: true}, ok); got != "" {
 		t.Errorf("an unaddressed device is already reported, got %q", got)
+	}
+}
+
+// monitorDevices skips a device it has no usable URL for, and a skip is
+// invisible: the card read a plain "Idle" while auto-cast was in fact never
+// going to do anything with it.
+func TestAutoCastWithoutUsableURLIsFlagged(t *testing.T) {
+	dev := DeviceConfig{Name: "Lounge", Host: "1.2.3.4", AutoCast: true}
+	if got := configWarning(dev, ""); got == "" {
+		t.Error("an auto-cast device with no URL and no default should be flagged")
+	}
+	if got := configWarning(dev, "192.168.1.5/dash"); got == "" {
+		t.Error("an auto-cast device with an unusable URL should be flagged")
+	}
+	// The URL problem is reported ahead of the missing IP: without a URL the
+	// device is never cast to at all, so it is the more fundamental of the two.
+	if got := configWarning(DeviceConfig{Name: "Lounge", AutoCast: true}, ""); !strings.Contains(got, "URL") {
+		t.Errorf("warning = %q, want the URL problem reported first", got)
+	}
+}
+
+// A device's own URL wins over the default; the fallback is what the monitor and
+// the warning must agree on.
+func TestEffectiveURL(t *testing.T) {
+	if got := effectiveURL(DeviceConfig{URL: "http://own/"}, "http://default/"); got != "http://own/" {
+		t.Errorf("effectiveURL = %q, want the device's own URL", got)
+	}
+	if got := effectiveURL(DeviceConfig{}, "http://default/"); got != "http://default/" {
+		t.Errorf("effectiveURL = %q, want the default", got)
+	}
+	if got := effectiveURL(DeviceConfig{}, ""); got != "" {
+		t.Errorf("effectiveURL = %q, want empty", got)
+	}
+}
+
+// Two status polls of the same device overlap routinely — /api/devices/status
+// and the monitor probe independently, each taking up to 15s — so the one that
+// started earlier can finish later. Applying it republished the older view: a
+// device seen playing flipped back to "Idle" for a whole interval.
+func TestOlderObservationDoesNotOverwriteNewerObservation(t *testing.T) {
+	resetCastState()
+	dev := DeviceConfig{Name: "Lounge", Host: "1.2.3.4"}
+
+	early, late := time.Now().Add(-2*time.Second), time.Now().Add(-time.Second)
+	if !observeCastState(dev, true, "84912283", late) {
+		t.Fatal("the first observation should be applied")
+	}
+	if observeCastState(dev, false, "", early) {
+		t.Error("an observation that began earlier should report as not applied")
+	}
+	if !isCasting(dev) {
+		t.Error("an earlier-started poll overwrote a later one's view")
+	}
+
+	// A genuinely newer poll must still get through, or the device can never be
+	// seen to drop the cast.
+	if !observeCastState(dev, false, "", time.Now()) {
+		t.Error("a newer observation should be applied")
+	}
+	if isCasting(dev) {
+		t.Error("newer observation not applied")
 	}
 }
 
 func TestPruneCastStatesDropsActions(t *testing.T) {
 	resetCastState()
-	setCastState(DeviceConfig{Name: "Gone", Host: "1.2.3.4"}, true)
+	dev := DeviceConfig{Name: "Gone", Host: "1.2.3.4"}
+	setCastState(dev, true)
+	observeCastState(dev, true, "84912283", time.Now())
 	pruneCastStates(nil)
 	castStatesMu.RLock()
-	n := len(castActions)
+	nActions, nObserved := len(castActions), len(castObserved)
 	castStatesMu.RUnlock()
-	if n != 0 {
-		t.Errorf("castActions has %d stale entries after prune", n)
+	if nActions != 0 {
+		t.Errorf("castActions has %d stale entries after prune", nActions)
+	}
+	if nObserved != 0 {
+		t.Errorf("castObserved has %d stale entries after prune", nObserved)
+	}
+}
+
+// catt reads a "-"-prefixed positional argument as a flag, and one it accepts
+// ("--version") makes it exit 0 without casting — recorded as a success, which
+// then arms the app-id learner to adopt whatever is really running on the device
+// as our own, fleet-wide.
+func TestCastableURL(t *testing.T) {
+	for _, u := range []string{
+		"http://192.168.1.5/dashboard",
+		"https://example.test/",
+		"http://host:8080/a?b=c#d",
+	} {
+		if !castableURL(u) {
+			t.Errorf("castableURL(%q) = false, want true", u)
+		}
+	}
+	for _, u := range []string{
+		"", "--version", "-h", "dashboard", "192.168.1.5",
+		"file:///etc/passwd", "ftp://example.test/",
+		"http:/dashboard", // parses, but has no host
+		"http://",
+		"http://\x7f/", // unparseable control character
+	} {
+		if castableURL(u) {
+			t.Errorf("castableURL(%q) = true, want false", u)
+		}
+	}
+}
+
+// The interval has a one-day ceiling, so a monitor that sleeps on the value it
+// read at the top of the cycle applied a lowered interval up to 24h late.
+func TestCheckIntervalTracksConfig(t *testing.T) {
+	cfgMu.Lock()
+	old := cfg
+	cfg = Config{CheckInterval: 86400}
+	cfgMu.Unlock()
+	defer func() {
+		cfgMu.Lock()
+		cfg = old
+		cfgMu.Unlock()
+	}()
+
+	if got := checkInterval(); got != 86400*time.Second {
+		t.Errorf("checkInterval = %v, want 24h", got)
+	}
+	cfgMu.Lock()
+	cfg.CheckInterval = 10
+	cfgMu.Unlock()
+	if got := checkInterval(); got != 10*time.Second {
+		t.Errorf("checkInterval after a config change = %v, want 10s", got)
+	}
+
+	// Clamped even if something bypasses normalizeConfig: both ends of the range
+	// otherwise turn the monitor into a hot loop.
+	cfgMu.Lock()
+	cfg.CheckInterval = 1 << 40
+	cfgMu.Unlock()
+	if got := checkInterval(); got != maxCheckInterval*time.Second {
+		t.Errorf("huge interval = %v, want the ceiling", got)
+	}
+	cfgMu.Lock()
+	cfg.CheckInterval = -1
+	cfgMu.Unlock()
+	if got := checkInterval(); got != minCheckInterval*time.Second {
+		t.Errorf("negative interval = %v, want the floor", got)
+	}
+}
+
+// A scan that cannot run has to say so on the "done" event: the UI overwrites
+// the status line when the stream ends, so a reason sent as a status was
+// replaced by the generic "No devices found".
+func TestTCPScanReportsWhyItCannotRun(t *testing.T) {
+	// Only exercise the give-up path. With a private subnet detected, tcpScan
+	// would go and probe all 254 hosts of the machine's real LAN, which a unit
+	// test has no business doing.
+	if len(localSubnets()) > 0 {
+		t.Skip("host has a private subnet; reaching this path would scan the real LAN")
+	}
+	var statuses []string
+	devices, failure := tcpScan(context.Background(), nil,
+		func(msg string) { statuses = append(statuses, msg) },
+		func(DiscoveredDevice) {},
+		func(int, int) {},
+	)
+	if failure == "" {
+		t.Error("a scan with no detectable subnet must explain itself on done")
+	}
+	if len(devices) != 0 {
+		t.Errorf("expected no devices, got %+v", devices)
+	}
+	if len(statuses) != 0 {
+		t.Errorf("the reason must ride on done, not on a status event: %q", statuses)
 	}
 }
 
