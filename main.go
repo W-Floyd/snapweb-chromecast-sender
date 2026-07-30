@@ -43,7 +43,6 @@ type Config struct {
 type DeviceStatus struct {
 	Name  string `json:"name"`
 	State string `json:"state"`
-	URL   string `json:"url,omitempty"`
 	Error string `json:"error,omitempty"`
 	// Foreign marks a device playing an app that is not our cast — someone
 	// started something on it. False whenever we cannot tell (see
@@ -465,13 +464,19 @@ func getLiveStatus(ctx context.Context, dev DeviceConfig) DeviceStatus {
 	} else {
 		ds.State = "Idle"
 	}
+	// Only "State: " is worth looking for. catt's status output has exactly six
+	// labels — Title, Time, Remaining time, State, Volume, Volume muted — so the
+	// "Content: " line this used to also parse never existed, and the URL it
+	// filled in was never set by anything or read by anyone.
+	//
+	// This line is narrow but real: catt includes player_state only when the media
+	// session reports a non-image content_type, which our own cast_site never does
+	// (hence the cached fallback above), but a media app can. When it is there it
+	// is the device's own truth — PAUSED, BUFFERING — so it wins over our guess.
 	scanner := bufio.NewScanner(strings.NewReader(out))
 	for scanner.Scan() {
-		line := scanner.Text()
-		if after, ok := strings.CutPrefix(line, "State: "); ok {
+		if after, ok := strings.CutPrefix(scanner.Text(), "State: "); ok {
 			ds.State = strings.TrimSpace(after)
-		} else if after, ok := strings.CutPrefix(line, "Content: "); ok {
-			ds.URL = strings.TrimSpace(after)
 		}
 	}
 	return ds

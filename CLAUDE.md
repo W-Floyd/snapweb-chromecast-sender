@@ -102,11 +102,17 @@ cast has none. DashCast does not support the Google media namespace, so `_is_idl
 false, `title` is `None`, and `_is_audiovideo` is false — meaning no `player_state`.
 Output for "our dashboard is up" is therefore byte-identical to a genuinely idle
 device: two `Volume:` lines and nothing else. There is no signal to infer from, and
-guessing "idle" would re-cast every tick and restart the dashboard forever. That also
-makes the `State: ` / `Content: ` parsing in `getLiveStatus` dead for our own casts —
-`echo_status` never emits `Content:` at all. Don't build on that path; an `auto_cast`
-device with no IP gets a `Warning` from `configWarning` instead, because the monitor
-genuinely cannot watch it.
+guessing "idle" would re-cast every tick and restart the dashboard forever. Don't build
+on that path; an `auto_cast` device with no IP gets a `Warning` from `configWarning`
+instead, because the monitor genuinely cannot watch it.
+
+The full set of labels `catt status` can print is `Title:`, `Time:`, `Remaining time:`,
+`State:`, `Volume:` and `Volume muted:` — so `getLiveStatus` parses `State: ` and
+nothing else. It once also looked for a `Content: ` line, which catt has never emitted;
+that fed a `DeviceStatus.URL` no code ever read. `State: ` itself only appears when the
+media session reports a non-image `content_type`, which our own `cast_site` never does
+and a media app may, so it is narrow but not dead — keep it, and don't add parsing for
+labels without checking that list first.
 
 `isCasting` means "playing *something*", not "playing ours" — a person casting
 Netflix sets it too. Telling the two apart needs the `app_id` the status helper
