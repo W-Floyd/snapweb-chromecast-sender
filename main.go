@@ -359,6 +359,20 @@ func saveConfig(c Config) error {
 		return err
 	}
 	tmp = "" // renamed away; nothing left to clean up
+	// Sync the directory too. f.Sync() above only makes the *contents* durable —
+	// the rename itself is a directory update, and until that is flushed a host
+	// crash can leave the config back at its previous version (or, on the first
+	// ever save, absent) with the caller having already been told the write
+	// succeeded and the monitor already acting on the new settings.
+	//
+	// Best-effort: some filesystems reject fsync on a directory, and failing the
+	// whole save there would reject a config already safely renamed into place.
+	if dir, err := os.Open(filepath.Dir(cfgPath)); err == nil {
+		if err := dir.Sync(); err != nil {
+			log.Printf("config dir sync: %v", err)
+		}
+		dir.Close()
+	}
 	return nil
 }
 
