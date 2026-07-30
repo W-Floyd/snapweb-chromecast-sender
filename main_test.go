@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -79,11 +80,8 @@ func TestSaveConfigAtomicAndReadable(t *testing.T) {
 	cfgPath = filepath.Join(dir, "config.json")
 	defer func() { cfgPath = oldPath }()
 
-	cfgMu.Lock()
-	cfg = Config{CheckInterval: 30, DefaultURL: "http://example/", Devices: []DeviceConfig{{Name: "A", Host: "1.2.3.4"}}}
-	cfgMu.Unlock()
-
-	if err := saveConfig(); err != nil {
+	want := Config{CheckInterval: 30, DefaultURL: "http://example/", Devices: []DeviceConfig{{Name: "A", Host: "1.2.3.4"}}}
+	if err := saveConfig(want); err != nil {
 		t.Fatalf("saveConfig: %v", err)
 	}
 
@@ -323,6 +321,39 @@ func TestForeignAppDetection(t *testing.T) {
 	observeCastState(dev, true, "CA5E9605", time.Now())
 	if !isForeignApp("CA5E9605") {
 		t.Error("a later foreign observation overwrote the learned cast app")
+	}
+}
+
+// A failed cast leaves nothing of ours running, so the next app to show up on
+// the device belongs to somebody else. Learning it as our own would make the
+// real dashboard read as foreign for the whole fleet — learnedCastApp is one
+// value — and the monitor would re-cast it on every tick.
+func TestFailedCastDoesNotLearnSomeoneElsesApp(t *testing.T) {
+	resetCastState()
+	dev := DeviceConfig{Name: "Lounge", Host: "1.2.3.4"}
+
+	setCastState(dev, true) // arms the learn flag
+	setCastError(dev, "Chromecast not found")
+
+	// Someone starts Netflix on it afterwards.
+	observeCastState(dev, true, "CA5E9605", time.Now())
+	if isForeignApp("84912283") {
+		t.Error("a failed cast let the next foreign app be learned as ours")
+	}
+	if isForeignApp("CA5E9605") {
+		t.Error("nothing has been learned, so nothing may be called foreign")
+	}
+}
+
+func TestUnaddressedDeviceIsNotProbed(t *testing.T) {
+	// A blank "+ Add manually" row has neither identifier. Probing it shelled out
+	// for the full timeout every poll, and every such row shares one deviceKey.
+	ds := getLiveStatus(context.Background(), DeviceConfig{})
+	if ds.Error == "" {
+		t.Error("an unaddressed device should report why it cannot be reached")
+	}
+	if ds.State != "unknown" {
+		t.Errorf("state = %q, want \"unknown\"", ds.State)
 	}
 }
 

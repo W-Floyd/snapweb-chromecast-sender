@@ -406,6 +406,10 @@
 
           es.onerror = () => {
             es.close()
+            // The server closes the stream right after its "done" event, and the
+            // browser can surface that close as an error even though the scan
+            // finished — reporting "Scan failed" over a completed result.
+            if (!this.scanning) return
             this.scanning = false
             this.scanProgress = null
             this.scanStatus = 'Scan failed'

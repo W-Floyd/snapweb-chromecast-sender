@@ -57,8 +57,12 @@ type DiscoveredDevice struct {
 }
 
 var (
-	cfg          Config
-	cfgMu        sync.RWMutex
+	cfg   Config
+	cfgMu sync.RWMutex
+	// cfgSaveMu serialises write-then-publish in POST /api/config so that the
+	// file on disk and the config the monitor acts on cannot end up disagreeing.
+	// Separate from cfgMu, which must not be held across a disk write.
+	cfgSaveMu    sync.Mutex
 	cfgPath      = "/config/config.json"
 	staticDir    = "/static"
 	statusScript = "/usr/local/lib/chromecast/cc_status.py"
@@ -190,6 +194,12 @@ func setCastError(dev DeviceConfig, msg string) {
 	// A failure is an action too: without this an in-flight poll that saw the
 	// device playing could land afterwards and delete the error we just recorded.
 	castActions[k] = time.Now()
+	// Disarm the learn flag. Nothing of ours is running, so the next app to
+	// appear on this device is somebody else's — and learning *that* as our own
+	// makes the real dashboard read as foreign, fleet-wide, and re-cast on every
+	// tick, which is exactly what learning the id instead of hardcoding it
+	// exists to prevent.
+	delete(castLearnPending, k)
 	castStatesMu.Unlock()
 }
 
@@ -281,10 +291,12 @@ func loadConfig() {
 	cfg = loaded
 }
 
-func saveConfig() error {
-	cfgMu.RLock()
-	data, err := json.MarshalIndent(cfg, "", "  ")
-	cfgMu.RUnlock()
+// saveConfig writes c to cfgPath atomically. It takes the config by value
+// rather than reading the global: the caller persists first and only then
+// publishes, so a write that fails cannot leave the monitor acting on settings
+// the disk never received.
+func saveConfig(c Config) error {
+	data, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -369,6 +381,13 @@ func getDeviceStatus(ctx context.Context, dev DeviceConfig) DeviceStatus {
 }
 
 func getLiveStatus(ctx context.Context, dev DeviceConfig) DeviceStatus {
+	// A row with neither identifier is what "+ Add manually" starts as. Shelling
+	// out anyway ran `catt -d '' status` for the full 10s on every poll, and every
+	// such row shares the deviceKey "name:", so their cast errors landed on each
+	// other. Say what is missing instead.
+	if dev.Name == "" && dev.Host == "" {
+		return DeviceStatus{State: "unknown", Error: "device has no name or IP address"}
+	}
 	if dev.Host != "" {
 		return getPychromecastStatus(ctx, dev)
 	}
@@ -465,6 +484,9 @@ func monitorDevices(ctx context.Context) {
 		if !dev.AutoCast {
 			continue
 		}
+		if dev.Name == "" && dev.Host == "" {
+			continue // nothing to target; see getLiveStatus
+		}
 		url := dev.URL
 		if url == "" {
 			url = defaultURL
@@ -555,16 +577,28 @@ func handleConfig(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		normalizeConfig(&newCfg)
-		cfgMu.Lock()
-		cfg = newCfg
-		cfgMu.Unlock()
-		// Devices can be renamed, re-addressed or deleted here; drop the cast
-		// state of anything that no longer exists.
-		pruneCastStates(newCfg.Devices)
-		if err := saveConfig(); err != nil {
+		// Persist before publishing, and serialise the whole write-then-publish
+		// so it stays atomic against a second POST. Applying first meant a failed
+		// write left the monitor acting on a config the disk never got — the user
+		// saw a 500, and a restart silently reverted behaviour to the old file.
+		// Two concurrent POSTs could likewise rename in the opposite order to the
+		// one they published in, leaving memory and disk permanently disagreeing.
+		cfgSaveMu.Lock()
+		err := saveConfig(newCfg)
+		if err == nil {
+			cfgMu.Lock()
+			cfg = newCfg
+			cfgMu.Unlock()
+		}
+		cfgSaveMu.Unlock()
+		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		// Devices can be renamed, re-addressed or deleted here; drop the cast
+		// state of anything that no longer exists. After the save, so a rejected
+		// write does not discard the state of devices that are still configured.
+		pruneCastStates(newCfg.Devices)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	default:
@@ -982,8 +1016,11 @@ func handleCast(w http.ResponseWriter, r *http.Request) {
 	req.Name = strings.TrimSpace(req.Name)
 	req.Host = strings.TrimSpace(req.Host)
 	req.URL = strings.TrimSpace(req.URL)
-	if req.Name == "" || req.URL == "" {
-		http.Error(w, "name and url required", http.StatusBadRequest)
+	// Either identifier will do — cattDeviceArgs prefers the IP, and auto-cast
+	// has always worked on a host-only device, so rejecting one here made the
+	// Cast button fail with a 400 on exactly the devices the monitor handles best.
+	if (req.Name == "" && req.Host == "") || req.URL == "" {
+		http.Error(w, "name or host, and url, required", http.StatusBadRequest)
 		return
 	}
 	go func() {
@@ -1020,8 +1057,8 @@ func handleStop(w http.ResponseWriter, r *http.Request) {
 	}
 	req.Name = strings.TrimSpace(req.Name)
 	req.Host = strings.TrimSpace(req.Host)
-	if req.Name == "" {
-		http.Error(w, "name required", http.StatusBadRequest)
+	if req.Name == "" && req.Host == "" {
+		http.Error(w, "name or host required", http.StatusBadRequest)
 		return
 	}
 	go func() {
