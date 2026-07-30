@@ -49,6 +49,11 @@ type DeviceStatus struct {
 	// started something on it. False whenever we cannot tell (see
 	// learnedCastApp), so the UI never accuses anyone on a guess.
 	Foreign bool `json:"foreign,omitempty"`
+	// Warning is advisory: the device's configuration limits what we can do, but
+	// nothing has failed. Kept separate from Error rather than folded into it,
+	// because getDeviceStatus merges a real cast failure into Error and a
+	// standing advisory there would permanently mask it.
+	Warning string `json:"warning,omitempty"`
 }
 
 type DiscoveredDevice struct {
@@ -407,6 +412,23 @@ func cattFailure(err error, out string) string {
 	return err.Error()
 }
 
+// configWarning reports an advisory problem with how a device is configured.
+// Pure and free of any subprocess, so it can be tested without catt.
+func configWarning(dev DeviceConfig) string {
+	// An auto-cast device with no IP cannot be monitored at all. `catt status`
+	// reports the *media* session, and a web page cast has none, so its output is
+	// byte-identical for "showing our dashboard" and "sitting idle" — the monitor
+	// has nothing to poll, never notices the cast being dropped, and quietly
+	// stops re-casting the device until the process restarts. Inferring idleness
+	// from that output is not an option: guessing "idle" would re-cast every tick
+	// and restart the dashboard forever. An IP switches the device to the
+	// pychromecast helper, which does report the app id.
+	if dev.AutoCast && dev.Host == "" && dev.Name != "" {
+		return "No IP set — auto-cast cannot tell if this device drops the cast. Scan and use 'Set IP'."
+	}
+	return ""
+}
+
 func getDeviceStatus(ctx context.Context, dev DeviceConfig) DeviceStatus {
 	ds := getLiveStatus(ctx, dev)
 	// Surface the last failed cast/stop when the device itself has nothing to
@@ -415,6 +437,7 @@ func getDeviceStatus(ctx context.Context, dev DeviceConfig) DeviceStatus {
 	if ds.Error == "" {
 		ds.Error = castError(dev)
 	}
+	ds.Warning = configWarning(dev)
 	return ds
 }
 

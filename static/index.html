@@ -84,6 +84,13 @@
                      class="text-amber-400 text-xs mt-0.5"
                      x-text="device.takeover ? 'In use by another app — will take over' : 'In use by another app — leaving it alone'">
                   </p>
+                  <!-- Advisory, not a failure: amber like the line above rather
+                       than red, so a real cast error stays the thing that
+                       stands out on the card. -->
+                  <p x-show="statusFor(device, i)?.warning"
+                     class="text-amber-400 text-xs mt-0.5"
+                     x-text="statusFor(device, i)?.warning">
+                  </p>
                   <p x-show="statusFor(device, i)?.error"
                      class="text-red-400 text-xs mt-1 break-all line-clamp-3"
                      :title="statusFor(device, i)?.error"
@@ -315,6 +322,10 @@
             })
             if (!res.ok) throw new Error(await res.text())
             await this.loadConfig()
+            // Status carries server-derived advisories about the config we just
+            // saved (a device left without an IP), so re-poll instead of leaving
+            // them to appear up to a full refresh interval later.
+            this.refreshStatuses()
             this.notify('Config saved', 'success')
           } catch (e) {
             this.notify('Save failed: ' + e.message, 'error')

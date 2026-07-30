@@ -96,6 +96,18 @@ IP when available, name otherwise — because friendly names are *not* unique an
 leaks between devices otherwise. It's lost on restart (devices get re-cast on the next
 tick) and pruned on config save. Never key new state by name alone.
 
+Concretely (traced through catt 0.13.1, `cli.py` → `util.echo_status` →
+`controllers.cast_info`): `catt status` describes the *media* session, and a web page
+cast has none. DashCast does not support the Google media namespace, so `_is_idle` is
+false, `title` is `None`, and `_is_audiovideo` is false — meaning no `player_state`.
+Output for "our dashboard is up" is therefore byte-identical to a genuinely idle
+device: two `Volume:` lines and nothing else. There is no signal to infer from, and
+guessing "idle" would re-cast every tick and restart the dashboard forever. That also
+makes the `State: ` / `Content: ` parsing in `getLiveStatus` dead for our own casts —
+`echo_status` never emits `Content:` at all. Don't build on that path; an `auto_cast`
+device with no IP gets a `Warning` from `configWarning` instead, because the monitor
+genuinely cannot watch it.
+
 `isCasting` means "playing *something*", not "playing ours" — a person casting
 Netflix sets it too. Telling the two apart needs the `app_id` the status helper
 reports, and `learnedCastApp` picks that up from the first poll after a cast we

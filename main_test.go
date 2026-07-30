@@ -432,6 +432,28 @@ func TestUnaddressedDeviceIsNotProbed(t *testing.T) {
 	}
 }
 
+// An auto-cast device with no IP is unmonitorable: `catt status` describes the
+// media session, a web page cast has none, and its output is identical for "our
+// dashboard is up" and "idle". The monitor therefore never notices a dropped
+// cast and silently stops re-casting, so the card has to say so.
+func TestAutoCastWithoutIPIsFlagged(t *testing.T) {
+	if configWarning(DeviceConfig{Name: "Lounge", AutoCast: true}) == "" {
+		t.Error("an auto-cast device with no IP should be flagged")
+	}
+	// An IP switches it to the pychromecast helper, which reports the app id.
+	if got := configWarning(DeviceConfig{Name: "Lounge", Host: "1.2.3.4", AutoCast: true}); got != "" {
+		t.Errorf("a device with an IP needs no warning, got %q", got)
+	}
+	// Nothing is monitoring it, so there is nothing to warn about.
+	if got := configWarning(DeviceConfig{Name: "Lounge"}); got != "" {
+		t.Errorf("a manual-only device needs no warning, got %q", got)
+	}
+	// getLiveStatus already explains this one; do not pile a second line on it.
+	if got := configWarning(DeviceConfig{AutoCast: true}); got != "" {
+		t.Errorf("an unaddressed device is already reported, got %q", got)
+	}
+}
+
 func TestPruneCastStatesDropsActions(t *testing.T) {
 	resetCastState()
 	setCastState(DeviceConfig{Name: "Gone", Host: "1.2.3.4"}, true)
