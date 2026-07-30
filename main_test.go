@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -459,6 +460,38 @@ func TestLocalSubnetsAreUnique(t *testing.T) {
 			t.Errorf("duplicate subnet %q returned", s)
 		}
 		seen[s] = true
+	}
+}
+
+// Auto-detect must never propose a subnet outside RFC1918. A scan connects to
+// all 254 hosts in the /24, so on a machine with a routable address (a VPS, or
+// an ISP handing out public IPv4 without NAT) this port-scanned strangers.
+// Asserted on the real interface list, which is what the scanner actually uses.
+func TestLocalSubnetsArePrivate(t *testing.T) {
+	for _, base := range localSubnets() {
+		// .1 stands in for the /24: IsPrivate is decided by the leading octets,
+		// all of which are present in the base the scanner returns.
+		ip := net.ParseIP(base + ".1")
+		if ip == nil {
+			t.Errorf("subnet %q is not a parseable /24 base", base)
+			continue
+		}
+		if !ip.IsPrivate() {
+			t.Errorf("auto-detect offered non-private subnet %q.0/24", base)
+		}
+	}
+}
+
+// The fallback in localSubnets exists to relax the interface-*name* heuristic.
+// It must not also relax the private-address check, or it would re-admit public
+// subnets on exactly the hosts the check is there to protect — one with nothing
+// but a routable address is where filtering leaves the list empty.
+func TestCollectSubnetsFiltersPublicEvenUnfiltered(t *testing.T) {
+	for _, base := range collectSubnets(false) {
+		ip := net.ParseIP(base + ".1")
+		if ip != nil && !ip.IsPrivate() {
+			t.Errorf("unfiltered collectSubnets returned public subnet %q.0/24", base)
+		}
 	}
 }
 

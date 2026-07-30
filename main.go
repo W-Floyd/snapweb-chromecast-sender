@@ -725,13 +725,19 @@ func isVirtualIface(name string) bool {
 	return false
 }
 
-// localSubnets returns the /24 base (e.g. "192.168.1") for each usable
-// non-loopback IPv4 interface, preferring physical ones.
+// localSubnets returns the /24 base (e.g. "192.168.1") for each usable private
+// IPv4 interface, preferring physical ones.
 func localSubnets() []string {
 	physical, all := collectSubnets(true), collectSubnets(false)
 	// Fall back to the unfiltered set rather than returning nothing: the prefix
 	// list is a heuristic, and on an unusual host it could filter out the only
 	// interface there is.
+	//
+	// Only the virtual-interface guess is relaxed here. The private-address check
+	// in collectSubnets is not part of the fallback and must never be — it is a
+	// fact about the address, not a guess about a name, and undoing it is exactly
+	// what would fire on the hosts that need it most (see below). A host with
+	// nothing private on it correctly auto-detects nothing.
 	if len(physical) == 0 {
 		return all
 	}
@@ -765,6 +771,23 @@ func collectSubnets(skipVirtual bool) []string {
 			// Skip link-local (169.254/16): an interface that failed DHCP has
 			// no peers worth probing.
 			if v4 == nil || v4.IsLinkLocalUnicast() {
+				continue
+			}
+			// Auto-detect only ever probes RFC1918 space. A scan opens a TCP
+			// connection to all 254 hosts in the /24 and sends an HTTP request to
+			// whatever answers on 8008, and on a host carrying a routable address
+			// — a VPS, or an ISP that hands out public IPv4 without NAT — that
+			// port-scanned 254 machines belonging to strangers, none of which the
+			// user asked for by clicking "Scan Network". IsPrivate also excludes
+			// CGNAT (100.64/10), where the neighbours are other ISP customers.
+			//
+			// The virtual-interface filter above does not cover this: it was about
+			// probe volume, so a real physical interface with a public address
+			// sails straight through it.
+			//
+			// A subnet typed into the UI is explicit intent and stays honoured —
+			// this check is only about what we go probing unasked.
+			if !v4.IsPrivate() {
 				continue
 			}
 			parts := strings.Split(v4.String(), ".")
@@ -846,7 +869,10 @@ func tcpScan(ctx context.Context, subnets []string, onStatus func(string), onFou
 		subnets = localSubnets()
 	}
 	if len(subnets) == 0 {
-		onStatus("No local IPv4 interfaces found")
+		// Name the private-address requirement: auto-detect declining to guess is
+		// not the same failure as having no network, and a host with only a public
+		// address needs its LAN subnet typed in rather than retried.
+		onStatus("No private IPv4 subnet detected — enter a subnet to scan")
 		return nil
 	}
 
