@@ -206,7 +206,7 @@ func TestCastStateKeyedByHost(t *testing.T) {
 	// Two devices sharing a friendly name must not share cast state.
 	a := DeviceConfig{Name: "Speaker", Host: "1.2.3.4"}
 	b := DeviceConfig{Name: "Speaker", Host: "5.6.7.8"}
-	setCastState(a, true)
+	setCastState(a, true, "")
 	if !isCasting(a) {
 		t.Error("a should be casting")
 	}
@@ -255,7 +255,7 @@ func TestCastErrorRecordedAndCleared(t *testing.T) {
 	}
 
 	// A later success clears the stale error.
-	setCastState(dev, true)
+	setCastState(dev, true, "")
 	if got := castError(dev); got != "" {
 		t.Errorf("error not cleared after success: %q", got)
 	}
@@ -277,6 +277,7 @@ func resetCastState() {
 	castActions = map[string]time.Time{}
 	castObserved = map[string]time.Time{}
 	castLearnPending = map[string]bool{}
+	castURLs = map[string]string{}
 	learnedCastApp, castAppCandidate = "", ""
 	castStatesMu.Unlock()
 }
@@ -285,7 +286,7 @@ func resetCastState() {
 func learnCastApp(t *testing.T, dev DeviceConfig, appID string) {
 	t.Helper()
 	for i := 0; i < 2; i++ {
-		setCastState(dev, true)
+		setCastState(dev, true, "")
 		observeCastState(dev, true, appID, time.Now())
 	}
 	if isForeignApp(appID) || !isForeignApp(appID+"-other") {
@@ -328,7 +329,7 @@ func TestStaleObservationDoesNotOverwriteNewerAction(t *testing.T) {
 
 	resetCastState()
 	probeStarted := time.Now().Add(-time.Second)
-	setCastState(dev, true) // cast completes while the probe is still running
+	setCastState(dev, true, "") // cast completes while the probe is still running
 	observeCastState(dev, false, "", probeStarted)
 	if !isCasting(dev) {
 		t.Error("stale idle observation overwrote a newer successful cast")
@@ -348,7 +349,7 @@ func TestStaleObservationDoesNotOverwriteNewerAction(t *testing.T) {
 	// A probe that *starts* after the action is current, and must still be able
 	// to notice that the device dropped the cast on its own.
 	resetCastState()
-	setCastState(dev, true)
+	setCastState(dev, true, "")
 	observeCastState(dev, false, "", time.Now())
 	if isCasting(dev) {
 		t.Error("a fresh observation should be applied")
@@ -369,7 +370,7 @@ func TestForeignAppDetection(t *testing.T) {
 	}
 
 	// One sighting is only a candidate — see castAppCandidate.
-	setCastState(dev, true)
+	setCastState(dev, true, "")
 	observeCastState(dev, true, "84912283", time.Now())
 	if isForeignApp("CA5E9605") {
 		t.Error("a single unconfirmed sighting must not be acted on")
@@ -409,14 +410,14 @@ func TestMislearnedCastAppSelfHeals(t *testing.T) {
 
 	// The next cast's poll sees the real dashboard and disagrees. That alone must
 	// drop the bad value, or nothing is ever cast again.
-	setCastState(dev, true)
+	setCastState(dev, true, "")
 	observeCastState(dev, true, "84912283", time.Now())
 	if isForeignApp("84912283") {
 		t.Error("a disagreeing observation left the mislearned app id in place")
 	}
 
 	// Casting resumes, and the next agreeing poll settles on the right id.
-	setCastState(dev, true)
+	setCastState(dev, true, "")
 	observeCastState(dev, true, "84912283", time.Now())
 	if isForeignApp("84912283") {
 		t.Error("our own app still reported as foreign after re-learning")
@@ -434,7 +435,7 @@ func TestStaleObservationIsReportedAsNotApplied(t *testing.T) {
 	dev := DeviceConfig{Name: "Lounge", Host: "1.2.3.4"}
 
 	probeStarted := time.Now().Add(-time.Second)
-	setCastState(dev, true)
+	setCastState(dev, true, "")
 	if observeCastState(dev, true, "CA5E9605", probeStarted) {
 		t.Error("an observation predating our cast should report as not applied")
 	}
@@ -451,7 +452,7 @@ func TestFailedCastDoesNotLearnSomeoneElsesApp(t *testing.T) {
 	resetCastState()
 	dev := DeviceConfig{Name: "Lounge", Host: "1.2.3.4"}
 
-	setCastState(dev, true) // arms the learn flag
+	setCastState(dev, true, "") // arms the learn flag
 	setCastError(dev, "Chromecast not found")
 
 	// Someone starts Netflix on it afterwards.
@@ -480,7 +481,7 @@ func TestIdleObservationDisarmsTheAppLearner(t *testing.T) {
 	b := DeviceConfig{Name: "Kitchen", Host: "5.6.7.8"}
 
 	for _, dev := range []DeviceConfig{a, b} {
-		setCastState(dev, true) // arms the learn flag
+		setCastState(dev, true, "") // arms the learn flag
 		// The cast reported success, but the device is sitting idle.
 		if !observeCastState(dev, false, "", time.Now()) {
 			t.Fatal("a fresh observation should be applied")
@@ -511,7 +512,7 @@ func TestUnidentifiableAppAlsoDisarmsTheLearner(t *testing.T) {
 	b := DeviceConfig{Name: "Kitchen", Host: "5.6.7.8"}
 
 	for _, dev := range []DeviceConfig{a, b} {
-		setCastState(dev, true) // arms the learn flag
+		setCastState(dev, true, "") // arms the learn flag
 		// Playing, but with no app id to attribute it to.
 		if !observeCastState(dev, true, "", time.Now()) {
 			t.Fatal("a fresh observation should be applied")
@@ -521,6 +522,28 @@ func TestUnidentifiableAppAlsoDisarmsTheLearner(t *testing.T) {
 	}
 	if isForeignApp("84912283") {
 		t.Error("an unnameable app left the learner armed, and someone else's app became ours")
+	}
+}
+
+// bufio.Scanner's default token limit is 64KB — exactly maxSubprocessOutput —
+// so subprocess output arriving as one long line failed the very first Scan
+// with ErrTooLong and yielded no lines at all. Both callers ignore that error,
+// so a status query silently stayed "unknown" and an mDNS scan silently found
+// nothing.
+func TestParsersSurviveOutputWithNoNewline(t *testing.T) {
+	long := strings.Repeat("x", maxSubprocessOutput)
+	if got := splitLines(long); len(got) != 1 || got[0] != long {
+		t.Errorf("splitLines dropped a %d-byte unterminated line: %d lines", len(long), len(got))
+	}
+	// The realistic shape: a device on one line, then a flood with no newline.
+	out := "192.168.1.5 - Lounge - Google Inc. Chromecast\n" + long
+	if got := parseCattScan(out); len(got) != 1 || got[0].Host != "192.168.1.5" {
+		t.Errorf("parseCattScan lost its devices to an overlong line: %+v", got)
+	}
+	// bufio.ScanLines strips a trailing CR; splitLines must too, or every parsed
+	// value carries an invisible character.
+	if got := splitLines("a\r\nb"); len(got) != 2 || got[0] != "a" || got[1] != "b" {
+		t.Errorf("splitLines(%q) = %q, want CR-stripped lines", "a\r\nb", got)
 	}
 }
 
@@ -654,12 +677,16 @@ func TestOlderObservationDoesNotOverwriteNewerObservation(t *testing.T) {
 func TestPruneCastStatesDropsActions(t *testing.T) {
 	resetCastState()
 	dev := DeviceConfig{Name: "Gone", Host: "1.2.3.4"}
-	setCastState(dev, true)
+	setCastState(dev, true, "http://dash/")
 	observeCastState(dev, true, "84912283", time.Now())
 	pruneCastStates(nil)
 	castStatesMu.RLock()
 	nActions, nObserved := len(castActions), len(castObserved)
+	nURLs := len(castURLs)
 	castStatesMu.RUnlock()
+	if nURLs != 0 {
+		t.Errorf("castURLs has %d stale entries after prune", nURLs)
+	}
 	if nActions != 0 {
 		t.Errorf("castActions has %d stale entries after prune", nActions)
 	}
@@ -758,6 +785,55 @@ func TestTCPScanReportsWhyItCannotRun(t *testing.T) {
 	}
 	if len(statuses) != 0 {
 		t.Errorf("the reason must ride on done, not on a status event: %q", statuses)
+	}
+}
+
+// A saved URL change has to reach a device that is already showing the old
+// page. monitorDevices skips anything it believes is casting, and an always-on
+// dashboard never drops the cast by itself, so without this the edit applied
+// only after a restart of the service and the save looked like a no-op.
+func TestLastCastURLTracksOnlyWhatWeCast(t *testing.T) {
+	resetCastState()
+	dev := DeviceConfig{Name: "Lounge", Host: "1.2.3.4"}
+
+	if _, ok := lastCastURL(dev); ok {
+		t.Error("a device we have never cast to must not claim a known URL")
+	}
+	// Observing a device playing says nothing about what put it there — this is
+	// the state after a restart, and re-casting on that guess would needlessly
+	// restart a dashboard that was already correct.
+	observeCastState(dev, true, "84912283", time.Now())
+	if _, ok := lastCastURL(dev); ok {
+		t.Error("an observation must not be mistaken for a cast of ours")
+	}
+
+	setCastState(dev, true, "http://old/")
+	if u, ok := lastCastURL(dev); !ok || u != "http://old/" {
+		t.Errorf("lastCastURL = (%q, %v), want the URL we cast", u, ok)
+	}
+	// An observation of the device still playing must not disturb it: that poll
+	// is how the monitor confirms our page is up, not a new claim about its URL.
+	observeCastState(dev, true, "84912283", time.Now())
+	if u, ok := lastCastURL(dev); !ok || u != "http://old/" {
+		t.Errorf("lastCastURL after an observation = (%q, %v), want it unchanged", u, ok)
+	}
+
+	// Nothing of ours is on screen after a stop, or after a failure.
+	setCastState(dev, false, "")
+	if _, ok := lastCastURL(dev); ok {
+		t.Error("a stop left a recorded URL behind")
+	}
+	setCastState(dev, true, "http://old/")
+	setCastError(dev, "Chromecast not found")
+	if _, ok := lastCastURL(dev); ok {
+		t.Error("a failed cast left a recorded URL behind")
+	}
+
+	// An empty URL is "we do not know", not a URL. Recording it would compare
+	// unequal to every configured URL and re-cast the device on every tick.
+	setCastState(dev, true, "")
+	if _, ok := lastCastURL(dev); ok {
+		t.Error("an empty URL was recorded as a known one")
 	}
 }
 

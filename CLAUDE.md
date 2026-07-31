@@ -120,7 +120,11 @@ nothing else. It once also looked for a `Content: ` line, which catt has never e
 that fed a `DeviceStatus.URL` no code ever read. `State: ` itself only appears when the
 media session reports a non-image `content_type`, which our own `cast_site` never does
 and a media app may, so it is narrow but not dead — keep it, and don't add parsing for
-labels without checking that list first.
+labels without checking that list first. Parse it with `splitLines`, not
+`bufio.Scanner`: the scanner's default token limit is 64KB, which is exactly
+`maxSubprocessOutput`, so a single unterminated line made the first `Scan` fail
+with `ErrTooLong` — an error both callers discard — and the parser saw nothing
+at all.
 
 `isCasting` means "playing *something*", not "playing ours" — a person casting
 Netflix sets it too. Telling the two apart needs the `app_id` the status helper
@@ -134,7 +138,13 @@ A status poll takes seconds, so one that started before a cast can land after it
 `castActions` timestamps our own casts and `observeCastState` drops any
 observation older than that — without it the poll's stale view overwrote the
 newer truth, which both erased fresh cast errors and re-cast devices that were
-already playing. `castObserved` does the same for polls against *each other*:
+already playing. `castURLs` is the other half of the skip: `isCasting` only says *something* of
+ours is up, not that it is the *current* page, so a device already showing the
+old URL was skipped forever and editing `default_url` looked like a no-op. Only
+a cast of ours writes it — a device merely *observed* playing gets no entry, so
+one already up when the process starts is left alone rather than restarted.
+
+`castObserved` does the same for polls against *each other*:
 `/api/devices/status` and the monitor probe the same device independently, so
 whichever started earlier can easily finish later. Any new timestamped state
 belongs in `pruneCastStates` and in `resetCastState` in the tests.

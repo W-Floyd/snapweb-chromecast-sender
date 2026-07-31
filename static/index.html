@@ -45,7 +45,7 @@
     <!-- Devices Section -->
     <section class="mb-8">
       <div class="flex items-center justify-between mb-4">
-        <h2 class="text-base font-semibold text-slate-200 uppercase tracking-wider text-xs">Devices</h2>
+        <h2 class="font-semibold text-slate-200 uppercase tracking-wider text-xs">Devices</h2>
         <div class="flex gap-2" x-show="config.devices.length > 0">
           <button @click="castAll()"
                   class="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 rounded-lg text-xs font-medium transition-colors">
@@ -146,7 +146,7 @@
     <!-- Config Section -->
     <section class="mb-8">
       <div class="flex items-center justify-between mb-4">
-        <h2 class="text-base font-semibold text-slate-200 uppercase tracking-wider text-xs">Configuration</h2>
+        <h2 class="font-semibold text-slate-200 uppercase tracking-wider text-xs">Configuration</h2>
         <button @click="saveConfig()" :disabled="saving"
                 class="px-4 py-1.5 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 rounded-lg text-sm font-medium transition-colors">
           <span x-show="!saving">Save</span>
@@ -195,7 +195,7 @@
     <!-- Scanner Section -->
     <section>
       <div class="flex items-center justify-between mb-3">
-        <h2 class="text-base font-semibold text-slate-200 uppercase tracking-wider text-xs">Network Scanner</h2>
+        <h2 class="font-semibold text-slate-200 uppercase tracking-wider text-xs">Network Scanner</h2>
         <button @click="scan()" :disabled="scanning"
                 class="flex items-center gap-2 px-4 py-1.5 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded-lg text-sm font-medium transition-colors">
           <svg :class="scanning && 'animate-spin'" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -288,8 +288,12 @@
 
         async init() {
           await this.loadConfig()
-          await this.refreshStatuses()
+          // Started before the status refresh, not after it: /api/devices/status
+          // shells out per device and can take 15s, and awaiting it left the
+          // scanner's subnet suggestions empty for that whole time even though
+          // /api/subnets answers instantly. Not awaited — nothing below needs it.
           this.loadSubnets()
+          await this.refreshStatuses()
           setInterval(() => this.refreshStatuses(), 30000)
         },
 

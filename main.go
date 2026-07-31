@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -89,6 +88,18 @@ var (
 	// a failed cast looks identical to a successful one in the UI — the device
 	// just quietly stays idle and the reason is only ever in the server log.
 	castErrors = map[string]string{}
+	// castURLs records the URL of the most recent cast *we* made, keyed by
+	// deviceKey. Without it the isCasting skip in monitorDevices held for as long
+	// as the device kept showing the old page — which for an always-on dashboard
+	// is forever — so saving a new URL, or a new default_url, looked like it had
+	// done nothing at all. That is the same silent no-op the interval re-read in
+	// monitorLoop exists to prevent.
+	//
+	// An entry exists only when we know what we put on screen. A device merely
+	// *observed* playing (one already showing something when the process started)
+	// gets none, because re-casting on that guess would restart a dashboard that
+	// was already correct.
+	castURLs = map[string]string{}
 	// castActions records when we last *acted* on a device (a cast or stop we
 	// initiated), keyed by deviceKey. A status probe takes seconds, so a probe
 	// that started before the cast can return after it and report the device as
@@ -174,20 +185,41 @@ func deviceLabel(dev DeviceConfig) string {
 }
 
 // setCastState records the outcome of a successful cast/stop, and clears any
-// error left by a previous failed attempt on the same device.
-func setCastState(dev DeviceConfig, playing bool) {
+// error left by a previous failed attempt on the same device. url is the page
+// we just put on the device, and is ignored for a stop.
+func setCastState(dev DeviceConfig, playing bool, url string) {
 	k := deviceKey(dev)
 	castStatesMu.Lock()
 	castStates[k] = playing
 	castActions[k] = time.Now()
 	delete(castErrors, k)
 	if playing {
+		// Absent rather than empty when we have no URL to record: castURLs means
+		// "we know what is on screen", and an empty string there would read as a
+		// known URL that no configured device can ever match, re-casting on every
+		// tick.
+		if url != "" {
+			castURLs[k] = url
+		} else {
+			delete(castURLs, k)
+		}
 		// Whatever the next poll finds running is what our cast runs as.
 		castLearnPending[k] = true
 	} else {
+		delete(castURLs, k)
 		delete(castLearnPending, k)
 	}
 	castStatesMu.Unlock()
+}
+
+// lastCastURL returns the page we most recently cast to dev, and whether we
+// have one at all. "No entry" is not "no URL": it means we did not put what is
+// on screen there, so nothing may be concluded about whether it is current.
+func lastCastURL(dev DeviceConfig) (string, bool) {
+	castStatesMu.RLock()
+	defer castStatesMu.RUnlock()
+	u, ok := castURLs[deviceKey(dev)]
+	return u, ok
 }
 
 // observeCastState records what a status poll saw, without disturbing a recorded
@@ -291,6 +323,9 @@ func setCastError(dev DeviceConfig, msg string) {
 	// A failure is an action too: without this an in-flight poll that saw the
 	// device playing could land afterwards and delete the error we just recorded.
 	castActions[k] = time.Now()
+	// Nothing of ours is on screen, so we no longer know what is — the same
+	// reasoning that disarms the learn flag below.
+	delete(castURLs, k)
 	// Disarm the learn flag. Nothing of ours is running, so the next app to
 	// appear on this device is somebody else's — and learning *that* as our own
 	// makes the real dashboard read as foreign, fleet-wide, and re-cast on every
@@ -337,6 +372,11 @@ func pruneCastStates(devices []DeviceConfig) {
 	for k := range castLearnPending {
 		if !keep[k] {
 			delete(castLearnPending, k)
+		}
+	}
+	for k := range castURLs {
+		if !keep[k] {
+			delete(castURLs, k)
 		}
 	}
 	castStatesMu.Unlock()
@@ -618,13 +658,32 @@ func getLiveStatus(ctx context.Context, dev DeviceConfig) DeviceStatus {
 	// session reports a non-image content_type, which our own cast_site never does
 	// (hence the cached fallback above), but a media app can. When it is there it
 	// is the device's own truth — PAUSED, BUFFERING — so it wins over our guess.
-	scanner := bufio.NewScanner(strings.NewReader(out))
-	for scanner.Scan() {
-		if after, ok := strings.CutPrefix(scanner.Text(), "State: "); ok {
+	for _, line := range splitLines(out) {
+		if after, ok := strings.CutPrefix(line, "State: "); ok {
 			ds.State = strings.TrimSpace(after)
 		}
 	}
 	return ds
+}
+
+// splitLines splits subprocess output into lines.
+//
+// Deliberately not bufio.Scanner: its default token limit is 64KB, which is
+// exactly maxSubprocessOutput, so output that arrives as one long line — a
+// single-line Python traceback from a broken pychromecast install is the
+// realistic case — made the very first Scan fail with ErrTooLong and return no
+// lines at all. Both callers ignore the scanner error, so the symptom was a
+// status stuck at "unknown" and a mDNS scan that found nothing, with the reason
+// discarded. The output is already a bounded string in memory, so a scanner
+// bought nothing to begin with.
+func splitLines(s string) []string {
+	lines := strings.Split(s, "\n")
+	// Match bufio.ScanLines and drop a trailing CR, so a \r\n stream does not
+	// leave every parsed value with an invisible character stuck to the end.
+	for i, l := range lines {
+		lines[i] = strings.TrimSuffix(l, "\r")
+	}
+	return lines
 }
 
 // statusQueryTimeout is the outermost layer of the budget documented in
@@ -815,11 +874,24 @@ func monitorDevices(ctx context.Context) {
 				continue
 			}
 		}
+		// A saved URL change has to reach a device that is already up. The skip
+		// below is what kept it from doing so: an always-on dashboard never drops
+		// the cast by itself, so editing default_url or a device's own URL applied
+		// only after a restart of this service — from the UI, the save simply did
+		// nothing. Only a URL we recorded ourselves counts (see castURLs); with no
+		// entry we did not put the current page there and must not guess.
+		stale := false
+		if prev, ok := lastCastURL(dev); ok && prev != url {
+			stale = true
+		}
 		// A foreign app sets the cast state too (isCasting means "playing
 		// something", not "playing ours"), so it must not short-circuit a
 		// takeover that the check above has already approved.
 		if isCasting(dev) && !foreign {
-			continue
+			if !stale {
+				continue
+			}
+			log.Printf("re-casting %q: URL changed", deviceLabel(dev))
 		}
 		if foreign {
 			log.Printf("taking %q back from another app", deviceLabel(dev))
@@ -831,7 +903,7 @@ func monitorDevices(ctx context.Context) {
 			log.Printf("cast error for %q: %v — %s", deviceLabel(dev), err, strings.TrimSpace(out))
 			setCastError(dev, cattFailure(err, out))
 		} else {
-			setCastState(dev, true)
+			setCastState(dev, true, url)
 		}
 	}
 }
@@ -966,9 +1038,8 @@ func parseCattScan(out string) []DiscoveredDevice {
 		seen[d.Host] = true
 		devices = append(devices, d)
 	}
-	scanner := bufio.NewScanner(strings.NewReader(out))
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+	for _, raw := range splitLines(out) {
+		line := strings.TrimSpace(raw)
 		// Emit on whichever of the pair completes the device. Keying the append
 		// off "Host:" alone assumed Name always came first; the reverse order
 		// left the pair sitting in cur and the device was never reported.
@@ -1479,7 +1550,7 @@ func handleCast(w http.ResponseWriter, r *http.Request) {
 			log.Printf("cast %q -> %s: %v — %s", deviceLabel(dev), req.URL, err, strings.TrimSpace(out))
 			setCastError(dev, cattFailure(err, out))
 		} else {
-			setCastState(dev, true)
+			setCastState(dev, true, req.URL)
 		}
 	}()
 	w.Header().Set("Content-Type", "application/json")
@@ -1514,7 +1585,7 @@ func handleStop(w http.ResponseWriter, r *http.Request) {
 			log.Printf("stop %q: %v — %s", deviceLabel(dev), err, strings.TrimSpace(out))
 			setCastError(dev, cattFailure(err, out))
 		} else {
-			setCastState(dev, false)
+			setCastState(dev, false, "")
 		}
 	}()
 	w.Header().Set("Content-Type", "application/json")
