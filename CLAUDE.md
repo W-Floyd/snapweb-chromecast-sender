@@ -15,6 +15,7 @@ a single-page web UI for managing devices and config.
 | [main.go](main.go) | The entire server: config, monitor loop, HTTP API, network scanning |
 | [main_test.go](main_test.go) | Unit tests for the parsing and state-tracking helpers |
 | [scripts/cc_status.py](scripts/cc_status.py) | pychromecast status helper, invoked as a subprocess per poll |
+| [scripts/test_cc_status.py](scripts/test_cc_status.py) | Its tests — no pychromecast, no device; kept out of the image by `.dockerignore` |
 | [static/index.html](static/index.html) | Whole web UI — markup, styles and JS in one file |
 | [Dockerfile](Dockerfile) | Two stages: Go build (alpine) → Python runtime (debian slim) |
 | [.dockerignore](.dockerignore) | Keeps `__pycache__`, `config/` and the local binary out of the image |
@@ -27,6 +28,7 @@ that way unless there's a strong reason; it's what makes the build trivial and f
 ```sh
 go build -o /dev/null . && go vet ./... && go test -race ./...   # the full check
 gofmt -l .                                                        # must print nothing
+python3 -m unittest discover -s scripts                           # the status helper
 
 # Run locally. The defaults are container paths, so the env overrides are required:
 CONFIG_PATH=$PWD/config/config.json STATIC_DIR=$PWD/static PORT=8083 go run .
@@ -68,8 +70,24 @@ as nothing at all. It also drops everything after the first object, because the
 watchdog thread can fire mid-emit and two concatenated objects are not valid JSON.
 
 Neither is installed outside the Docker image, so `/api/devices/*` degrades to error
-rows when running `go run` on a dev machine. That's expected. **The tests are pure Go
-and need neither** — keep it that way; don't add tests that shell out to `catt`.
+rows when running `go run` on a dev machine. That's expected. **No test may shell out
+to `catt` or to the status helper** — keep it that way.
+
+The way the *rest* of the casting logic is still tested is three function variables —
+`probeDevice`, `castSite`, `stopCast` — that the tests substitute (`withFakeCatt`,
+`withProbe`). They exist because `monitorDevices` is the only code that both probes a
+device and decides whether to cast to it, so none of its ordering could be exercised
+while it shelled out directly, and the same went for the goroutines in
+`/api/devices/cast` and `/stop`, which are where a failure *becomes* a `castErrors`
+entry. A new subprocess call in that path belongs behind one of them, and a new
+decision in the loop belongs in a test that drives it — the fake probe deliberately
+applies the observation the real one does, because the loop reads `castStates`, not
+the returned struct.
+
+The layered timeouts are not asserted by hand: `TestStatusQueryTimeoutOutlastsTheScriptWatchdog`
+reads `OVERALL_TIMEOUT` and friends straight out of `cc_status.py` (no interpreter
+needed) and checks the ordering, because a comment asking the next reader to go and
+check the other language is exactly what does not happen.
 
 Timeout budgets are layered and must stay ordered: `PROBE_TIMEOUT` < `CONNECT_TIMEOUT`
 < `OVERALL_TIMEOUT` (12s watchdog) < the Go side's 15s context in
@@ -105,8 +123,8 @@ on the first such row only, and `duplicateDeviceKeys` feeds `configWarning` so t
 others say why they are inert.
 
 `autoCastTargets` is also where every skip `monitorDevices` makes *before* touching
-the network lives. Keeping it pure is what makes those skips testable at all — the
-rest of the loop cannot run in a test, because it shells out.
+the network lives. Keeping it pure keeps those skips assertable one row at a time;
+the rest of the loop is covered through the subprocess seams described above.
 
 Concretely (traced through catt 0.13.1, `cli.py` → `util.echo_status` →
 `controllers.cast_info`): `catt status` describes the *media* session, and a web page
@@ -126,13 +144,23 @@ device, because "no URL and no default" and "two rows for one device" are proper
 of the device *and* its context, not of the device alone. Warnings, not `castErrors`:
 a standing config problem recorded as a fresh cast failure every tick would keep
 bumping `castActions` and suppress every status observation of that device for good.
+
+Order matters inside it. For an `auto_cast` row the two URL problems are reported
+*ahead* of the duplicate advisory, because they stop the device being cast at all
+whereas the duplicate note only says which row does the casting — and
+`autoCastTargets` claims a `deviceKey` for the first matching row *before* it looks at
+that row's URL, so a duplicated pair whose first row has the unusable URL is never
+cast and "only the first is auto-cast" was actively misleading. A row with auto-cast
+off skips the URL gates entirely, so it keeps the duplicate advisory.
+
 The implication runs one way only — a warned device may still be cast to (one with no
 IP is cast blind; the first row of a duplicated pair is the row that gets cast) — so
 `TestEverySkippedDeviceIsExplained` asserts only the direction that hides a problem.
 
 The full set of labels `catt status` can print is `Title:`, `Time:`, `Remaining time:`,
-`State:`, `Volume:` and `Volume muted:` — so `getLiveStatus` parses `State: ` and
-nothing else. It once also looked for a `Content: ` line, which catt has never emitted;
+`State:`, `Volume:` and `Volume muted:` — so `cattStatusState` parses `State: ` and
+nothing else (and ignores it when empty: a bare `State: ` blanked the card's only
+state line, which reads as a UI fault rather than as the device saying nothing). It once also looked for a `Content: ` line, which catt has never emitted;
 that fed a `DeviceStatus.URL` no code ever read. `State: ` itself only appears when the
 media session reports a non-image `content_type`, which our own `cast_site` never does
 and a media app may, so it is narrow but not dead — keep it, and don't add parsing for
@@ -167,11 +195,12 @@ belongs in `pruneCastStates` and in `resetCastState` in the tests.
 
 **The monitor does not just sleep the interval.** `monitorLoop` waits on a timer
 that `POST /api/config` interrupts through `configChanged`, and re-reads
-`checkInterval()` each time round. The interval ceiling is a day, so a plain sleep
-on the value read at the top of the cycle applied a *lowered* interval up to 24h
-late and the save looked like it had done nothing. The deadline stays measured from
-the start of the wait, so a burst of saves can only shorten it, never postpone the
-next poll.
+`checkInterval()` each time round through `remainingWait`. The interval ceiling is a
+day, so a plain sleep on the value read at the top of the cycle applied a *lowered*
+interval up to 24h late and the save looked like it had done nothing. The deadline
+stays measured from the start of the wait, so a burst of saves can only shorten it,
+never postpone the next poll. `remainingWait` is a separate function so both of those
+are direct assertions rather than a test that has to wait out a real interval.
 
 **A cast is reported before it happens.** `/api/devices/cast` and `/stop` answer
 immediately and run `catt` in a goroutine, so failures can't ride on the HTTP response.

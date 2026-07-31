@@ -25,6 +25,10 @@ jobs:
           fi
       - run: go vet ./...
       - run: go test -race ./...
+      # The status helper is half of the subprocess contract, and its tests need
+      # neither pychromecast nor a device — see scripts/test_cc_status.py.
+      - name: status helper tests
+        run: python3 -m unittest discover -s scripts
 
   build:
     needs: test

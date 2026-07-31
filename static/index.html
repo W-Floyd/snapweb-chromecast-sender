@@ -330,11 +330,17 @@
             // Go struct field Config.check_interval of type int", shown verbatim
             // in the toast. The server clamps the range; only the *type* has to
             // be right before it gets there.
-            const interval = Math.trunc(Number(this.config.check_interval))
-            const payload = {
-              ...this.config,
-              check_interval: Number.isFinite(interval) && interval > 0 ? interval : 60,
-            }
+            //
+            // Capped at the ceiling as well, matching the input's max: the
+            // number box accepts a pasted 1e30 quite happily, max attribute or
+            // not, and a value that large does not fit a Go `int` — so it came
+            // back as "cannot unmarshal number 1e+30 ... of type int" in the
+            // toast instead of being clamped like every other over-large
+            // interval. The server clamps the range it can decode; this only has
+            // to keep the value inside what it can decode at all.
+            const raw = Math.trunc(Number(this.config.check_interval))
+            const interval = Number.isFinite(raw) && raw > 0 ? Math.min(raw, 86400) : 60
+            const payload = { ...this.config, check_interval: interval }
             const res = await fetch('/api/config', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },

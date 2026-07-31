@@ -8,6 +8,10 @@ chromecast-sender
 # compiled by a different Python than the runtime image's.
 **/__pycache__
 
+# The status helper's tests. `COPY scripts/` takes the whole directory, and the
+# runtime image has no business carrying them.
+scripts/test_*.py
+
 # Local runtime state; must not be baked into the image.
 config
 

@@ -9,7 +9,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -25,6 +27,10 @@ func TestParseSubnet(t *testing.T) {
 		{"192.168.1.*", "192.168.1"},
 		{"10.0.0.42", "10.0.0"},
 		{"  192.168.1.0/24  ", "192.168.1"},
+		// Spaces around the mask: the cut leaves a trailing one, which neither
+		// net.ParseIP nor the digit check accepts, so this read as "Invalid subnet".
+		{"192.168.1.0 / 24", "192.168.1"},
+		{"192.168.1 / 24", "192.168.1"},
 		{"", ""},
 		{"not-an-ip", ""},
 		{"192.168", ""},
@@ -647,10 +653,48 @@ func TestLimitedBufferKeepsThePrefixAndClaimsTheWholeWrite(t *testing.T) {
 // The layered budget in cc_status.py only works if the Go side outlasts the
 // script's own watchdog; otherwise the script is killed with nothing on the pipe,
 // which is the failure mode the watchdog exists to avoid.
+//
+// Read out of the script rather than hardcoded: the two halves of the budget live
+// in different languages, and a comment asking the next reader to check the other
+// side is exactly what does not happen. Needs no Python — it is the source file
+// that is consulted, not the interpreter.
 func TestStatusQueryTimeoutOutlastsTheScriptWatchdog(t *testing.T) {
-	if statusQueryTimeout <= 12*time.Second {
-		t.Errorf("statusQueryTimeout = %v, must exceed the script's 12s watchdog", statusQueryTimeout)
+	watchdog := pythonSeconds(t, "OVERALL_TIMEOUT")
+	if statusQueryTimeout <= watchdog {
+		t.Errorf("statusQueryTimeout = %v, must exceed the script's %v watchdog", statusQueryTimeout, watchdog)
 	}
+	// And the script's own layers must stay ordered inside that, or a stage is
+	// killed by the watchdog before it can report what went wrong.
+	probe, connect := pythonSeconds(t, "PROBE_TIMEOUT"), pythonSeconds(t, "CONNECT_TIMEOUT")
+	disconnect := pythonSeconds(t, "DISCONNECT_TIMEOUT")
+	if !(probe < connect && connect < watchdog && connect+disconnect < watchdog) {
+		t.Errorf("script budget out of order: probe %v, connect %v, disconnect %v, watchdog %v",
+			probe, connect, disconnect, watchdog)
+	}
+}
+
+// pythonSeconds reads an integer-seconds constant out of the status helper.
+func pythonSeconds(t *testing.T, name string) time.Duration {
+	t.Helper()
+	src, err := os.ReadFile(filepath.Join("scripts", "cc_status.py"))
+	if err != nil {
+		t.Fatalf("read the status helper: %v", err)
+	}
+	for _, line := range splitLines(string(src)) {
+		value, ok := strings.CutPrefix(line, name+" = ")
+		if !ok {
+			continue
+		}
+		// Trailing comment, as every one of these constants carries.
+		value, _, _ = strings.Cut(value, "#")
+		n, err := strconv.Atoi(strings.TrimSpace(value))
+		if err != nil {
+			t.Fatalf("%s is not an integer number of seconds: %q", name, value)
+		}
+		return time.Duration(n) * time.Second
+	}
+	t.Fatalf("%s not found in the status helper", name)
+	return 0
 }
 
 func TestUnaddressedDeviceIsNotProbed(t *testing.T) {
@@ -1035,6 +1079,429 @@ func sseEvents(t *testing.T, body string) []ScanEvent {
 	return events
 }
 
+// --- stand-ins for the two subprocesses -------------------------------------
+
+// fakeCatt records what the code under test asked catt to do, and answers with a
+// canned result. Installed over the castSite/stopCast seams by withFakeCatt.
+type fakeCatt struct {
+	mu    sync.Mutex
+	casts []castCall
+	stops []string
+	out   string
+	err   error
+}
+
+type castCall struct {
+	key string // deviceKey, so a name/host mix-up cannot pass unnoticed
+	url string
+}
+
+func (f *fakeCatt) cast(_ context.Context, dev DeviceConfig, url string) (string, error) {
+	f.mu.Lock()
+	f.casts = append(f.casts, castCall{deviceKey(dev), url})
+	f.mu.Unlock()
+	return f.out, f.err
+}
+
+func (f *fakeCatt) stop(_ context.Context, dev DeviceConfig) (string, error) {
+	f.mu.Lock()
+	f.stops = append(f.stops, deviceKey(dev))
+	f.mu.Unlock()
+	return f.out, f.err
+}
+
+func (f *fakeCatt) recorded() ([]castCall, []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]castCall{}, f.casts...), append([]string{}, f.stops...)
+}
+
+// castedURLs is the sequence of URLs cast so far, which is what the
+// duplicate-row and stale-URL regressions are visible in.
+func (f *fakeCatt) castedURLs() []string {
+	casts, _ := f.recorded()
+	urls := make([]string, len(casts))
+	for i, c := range casts {
+		urls[i] = c.url
+	}
+	return urls
+}
+
+func withFakeCatt(t *testing.T) *fakeCatt {
+	t.Helper()
+	f := &fakeCatt{}
+	savedCast, savedStop := castSite, stopCast
+	castSite, stopCast = f.cast, f.stop
+	t.Cleanup(func() { castSite, stopCast = savedCast, savedStop })
+	return f
+}
+
+func withProbe(t *testing.T, fn func(context.Context, DeviceConfig) DeviceStatus) {
+	t.Helper()
+	saved := probeDevice
+	probeDevice = fn
+	t.Cleanup(func() { probeDevice = saved })
+}
+
+// fakeProbe stands in for getPychromecastStatus, including the part that matters
+// most: it *applies* the observation. The monitor's decisions read castStates
+// rather than the returned struct, so a probe that only returned a state would
+// exercise none of the ordering these tests are about. An error short-circuits
+// both, exactly as an unreachable device does.
+func fakeProbe(playing bool, appID, errMsg string, foreign bool) func(context.Context, DeviceConfig) DeviceStatus {
+	return func(_ context.Context, dev DeviceConfig) DeviceStatus {
+		ds := DeviceStatus{Name: dev.Name, Host: dev.Host, State: "unknown"}
+		if errMsg != "" {
+			ds.Error = errMsg
+			return ds
+		}
+		observeCastState(dev, playing, appID, time.Now())
+		ds.State, ds.Foreign = "Idle", foreign
+		if playing {
+			ds.State = "Playing"
+		}
+		return ds
+	}
+}
+
+// echoProbe reports the device as showing whatever we last put on it, which is
+// what an always-on dashboard looks like from the second tick onwards. Used for
+// the multi-tick tests, where a fixed answer would beg the question.
+func echoProbe(_ context.Context, dev DeviceConfig) DeviceStatus {
+	playing := isCasting(dev)
+	observeCastState(dev, playing, "app-ours", time.Now())
+	ds := DeviceStatus{Name: dev.Name, Host: dev.Host, State: "Idle"}
+	if playing {
+		ds.State = "Playing"
+	}
+	return ds
+}
+
+// --- monitorDevices ---------------------------------------------------------
+
+// The tick that does the actual work: probe, decide, cast. Everything below
+// drives it through the seams above, because the decisions it makes are all
+// invisible from the outside — a device the monitor has silently stopped
+// managing looks exactly like one it is managing well.
+
+func TestMonitorDevicesCastsAnIdleDevice(t *testing.T) {
+	resetCastState()
+	f := withFakeCatt(t)
+	withProbe(t, fakeProbe(false, "", "", false))
+	dev := DeviceConfig{Name: "Lounge", Host: "1.2.3.4", AutoCast: true}
+	withConfig(t, Config{CheckInterval: 60, DefaultURL: "http://dash/", Devices: []DeviceConfig{dev}})
+
+	monitorDevices(context.Background())
+
+	casts, _ := f.recorded()
+	if len(casts) != 1 || casts[0].key != "host:1.2.3.4" || casts[0].url != "http://dash/" {
+		t.Fatalf("casts = %+v, want one cast of the default URL to the device's IP", casts)
+	}
+	if !isCasting(dev) {
+		t.Error("a successful cast was not recorded as playing")
+	}
+	// Recorded so that a later URL edit can be noticed; see lastCastURL.
+	if u, ok := lastCastURL(dev); !ok || u != "http://dash/" {
+		t.Errorf("lastCastURL = (%q, %v), want the URL we just cast", u, ok)
+	}
+	if got := castError(dev); got != "" {
+		t.Errorf("a successful cast left an error: %q", got)
+	}
+}
+
+// A device's own URL wins over the default, and the monitor must cast the same
+// URL it records — otherwise the next tick judges its own cast stale and restarts
+// the dashboard on every single tick.
+func TestMonitorDevicesUsesTheDeviceURLAndThenLeavesItAlone(t *testing.T) {
+	resetCastState()
+	f := withFakeCatt(t)
+	withProbe(t, echoProbe)
+	dev := DeviceConfig{Name: "Lounge", Host: "1.2.3.4", URL: "http://own/", AutoCast: true}
+	withConfig(t, Config{CheckInterval: 60, DefaultURL: "http://dash/", Devices: []DeviceConfig{dev}})
+
+	for i := 0; i < 4; i++ {
+		monitorDevices(context.Background())
+	}
+	if got := f.castedURLs(); len(got) != 1 || got[0] != "http://own/" {
+		t.Errorf("casts across four ticks = %v, want exactly one of the device's own URL", got)
+	}
+}
+
+// The saved-URL-change regression: an always-on dashboard never drops the cast by
+// itself, so without the recorded-URL comparison a new default_url applied only
+// after a restart of the service and the save looked like a no-op.
+func TestMonitorDevicesReCastsWhenTheURLChanges(t *testing.T) {
+	resetCastState()
+	f := withFakeCatt(t)
+	withProbe(t, echoProbe)
+	dev := DeviceConfig{Name: "Lounge", Host: "1.2.3.4", AutoCast: true}
+	withConfig(t, Config{CheckInterval: 60, DefaultURL: "http://old/", Devices: []DeviceConfig{dev}})
+
+	monitorDevices(context.Background())
+	cfgMu.Lock()
+	cfg.DefaultURL = "http://new/"
+	cfgMu.Unlock()
+	monitorDevices(context.Background())
+	monitorDevices(context.Background())
+
+	if got := f.castedURLs(); len(got) != 2 || got[0] != "http://old/" || got[1] != "http://new/" {
+		t.Errorf("casts = %v, want the old URL then the new one, and no third cast", got)
+	}
+}
+
+// A device already playing when the process starts gets no castURLs entry, so
+// nothing may be concluded about whether its page is current — re-casting on that
+// guess would restart a dashboard that was already correct.
+func TestMonitorDevicesLeavesADeviceItDidNotCastAlone(t *testing.T) {
+	resetCastState()
+	f := withFakeCatt(t)
+	withProbe(t, fakeProbe(true, "app-ours", "", false))
+	dev := DeviceConfig{Name: "Lounge", Host: "1.2.3.4", AutoCast: true}
+	withConfig(t, Config{CheckInterval: 60, DefaultURL: "http://dash/", Devices: []DeviceConfig{dev}})
+
+	monitorDevices(context.Background())
+	if got := f.castedURLs(); len(got) != 0 {
+		t.Errorf("casts = %v, want none: the device was already playing something we did not put there", got)
+	}
+}
+
+// Somebody is watching something. Leave it alone unless takeover says otherwise —
+// the whole point of noticing a foreign app is to not yank the TV out from under
+// whoever is using it.
+func TestMonitorDevicesRespectsTheTakeoverFlag(t *testing.T) {
+	for _, takeover := range []bool{false, true} {
+		resetCastState()
+		f := withFakeCatt(t)
+		withProbe(t, fakeProbe(true, "app-theirs", "", true))
+		dev := DeviceConfig{Name: "Lounge", Host: "1.2.3.4", AutoCast: true, Takeover: takeover}
+		withConfig(t, Config{CheckInterval: 60, DefaultURL: "http://dash/", Devices: []DeviceConfig{dev}})
+
+		monitorDevices(context.Background())
+
+		got := f.castedURLs()
+		if takeover && len(got) != 1 {
+			t.Errorf("takeover on: casts = %v, want the device reclaimed", got)
+		}
+		if !takeover && len(got) != 0 {
+			t.Errorf("takeover off: casts = %v, want the other app left alone", got)
+		}
+	}
+}
+
+// A foreign app sets the cast state too — isCasting means "playing something",
+// not "playing ours" — so it must not short-circuit an approved takeover.
+func TestMonitorDevicesTakesOverADeviceItBelievesIsCasting(t *testing.T) {
+	resetCastState()
+	f := withFakeCatt(t)
+	dev := DeviceConfig{Name: "Lounge", Host: "1.2.3.4", AutoCast: true, Takeover: true}
+	withConfig(t, Config{CheckInterval: 60, DefaultURL: "http://dash/", Devices: []DeviceConfig{dev}})
+
+	// Our own cast is up and current, so the stale-URL check cannot be what
+	// triggers the re-cast; only the foreign app may.
+	withProbe(t, echoProbe)
+	monitorDevices(context.Background())
+	withProbe(t, fakeProbe(true, "app-theirs", "", true))
+	monitorDevices(context.Background())
+
+	if got := f.castedURLs(); len(got) != 2 {
+		t.Errorf("casts = %v, want a second one to reclaim the device", got)
+	}
+}
+
+// A probe error means the device is off or unreachable, so a cast cannot succeed.
+// Skipping matters: catt would spend its full 30s timeout failing, serially, and
+// a couple of powered-off TVs kept the loop permanently busy.
+func TestMonitorDevicesSkipsAnUnreachableDevice(t *testing.T) {
+	resetCastState()
+	f := withFakeCatt(t)
+	withProbe(t, fakeProbe(false, "", "1.2.3.4 is not reachable on port 8009", false))
+	dev := DeviceConfig{Name: "Lounge", Host: "1.2.3.4", AutoCast: true}
+	withConfig(t, Config{CheckInterval: 60, DefaultURL: "http://dash/", Devices: []DeviceConfig{dev}})
+
+	monitorDevices(context.Background())
+
+	if got := f.castedURLs(); len(got) != 0 {
+		t.Errorf("casts = %v, want none for an unreachable device", got)
+	}
+	// The live probe is what reports this on the card; a standing unreachability
+	// must not also be recorded as a cast failure, which would bump castActions
+	// every tick and suppress every observation of the device.
+	if got := castError(dev); got != "" {
+		t.Errorf("castError = %q, want the skip left it clear", got)
+	}
+}
+
+// A cast that fails has to leave a reason behind: /api/devices/status merges it
+// onto the card, and without it the device just quietly stays idle.
+func TestMonitorDevicesRecordsAndRetriesAFailedCast(t *testing.T) {
+	resetCastState()
+	f := withFakeCatt(t)
+	f.err, f.out = errors.New("exit status 1"), "Device not found.\n"
+	withProbe(t, echoProbe)
+	dev := DeviceConfig{Name: "Lounge", Host: "1.2.3.4", AutoCast: true}
+	withConfig(t, Config{CheckInterval: 60, DefaultURL: "http://dash/", Devices: []DeviceConfig{dev}})
+
+	monitorDevices(context.Background())
+	if got := castError(dev); got != "Device not found." {
+		t.Errorf("castError = %q, want catt's own explanation", got)
+	}
+	if isCasting(dev) {
+		t.Error("a failed cast left the device marked as playing")
+	}
+	if _, ok := lastCastURL(dev); ok {
+		t.Error("a failed cast recorded a URL as being on screen")
+	}
+	// And the next tick tries again rather than giving up on it.
+	monitorDevices(context.Background())
+	if got := f.castedURLs(); len(got) != 2 {
+		t.Errorf("casts = %v, want the failure retried on the next tick", got)
+	}
+}
+
+// Two rows for one device share a single deviceKey, and with it a single
+// castURLs entry. With a different URL on each row the monitor cast row one's
+// page, judged it stale against row two's, cast that, and repeated the pair on
+// every tick: an always-on dashboard restarting itself forever.
+func TestMonitorDevicesDoesNotAlternateBetweenDuplicateRows(t *testing.T) {
+	resetCastState()
+	f := withFakeCatt(t)
+	withProbe(t, echoProbe)
+	withConfig(t, Config{CheckInterval: 60, Devices: []DeviceConfig{
+		{Name: "First", Host: "1.2.3.4", URL: "http://a/", AutoCast: true},
+		{Name: "Second", Host: "1.2.3.4", URL: "http://b/", AutoCast: true},
+	}})
+
+	for i := 0; i < 5; i++ {
+		monitorDevices(context.Background())
+	}
+	if got := f.castedURLs(); len(got) != 1 || got[0] != "http://a/" {
+		t.Errorf("casts across five ticks = %v, want a single cast of the first row's URL", got)
+	}
+}
+
+// A device with no IP cannot be probed at all: `catt status` describes the media
+// session and a web page cast has none. It is cast blind, once, and then left
+// alone — guessing "idle" from that output would restart the dashboard every tick.
+func TestMonitorDevicesCastsBlindWithoutAnIP(t *testing.T) {
+	resetCastState()
+	f := withFakeCatt(t)
+	withProbe(t, func(_ context.Context, dev DeviceConfig) DeviceStatus {
+		t.Errorf("a device with no IP must not be probed: %+v", dev)
+		return DeviceStatus{}
+	})
+	dev := DeviceConfig{Name: "Lounge", AutoCast: true}
+	withConfig(t, Config{CheckInterval: 60, DefaultURL: "http://dash/", Devices: []DeviceConfig{dev}})
+
+	monitorDevices(context.Background())
+	monitorDevices(context.Background())
+
+	casts, _ := f.recorded()
+	if len(casts) != 1 || casts[0].key != "name:Lounge" {
+		t.Errorf("casts = %+v, want exactly one, keyed by name", casts)
+	}
+}
+
+// The skips autoCastTargets makes are asserted directly elsewhere; this is the
+// end-to-end version, so that a future change which moves a decision back into
+// the loop cannot quietly start casting to a row that should be inert.
+func TestMonitorDevicesActsOnlyOnAutoCastTargets(t *testing.T) {
+	resetCastState()
+	f := withFakeCatt(t)
+	withProbe(t, fakeProbe(false, "", "", false))
+	withConfig(t, Config{CheckInterval: 60, DefaultURL: "http://dash/", Devices: []DeviceConfig{
+		{Name: "Off", Host: "1.1.1.1"},
+		{AutoCast: true},
+		{Name: "BadURL", Host: "2.2.2.2", URL: "--version", AutoCast: true},
+		{Name: "Fine", Host: "3.3.3.3", AutoCast: true},
+	}})
+
+	monitorDevices(context.Background())
+
+	casts, _ := f.recorded()
+	if len(casts) != 1 || casts[0].key != "host:3.3.3.3" {
+		t.Errorf("casts = %+v, want only the one usable row", casts)
+	}
+}
+
+// --- /api/devices/cast and /stop: the part that runs after the response ------
+
+// The handlers answer immediately and run catt in a goroutine, so a failure
+// cannot ride on the HTTP response — it has to land in castErrors and be merged
+// into the next status poll.
+func TestCastHandlerRecordsItsOutcomeAfterResponding(t *testing.T) {
+	resetCastState()
+	f := withFakeCatt(t)
+	f.err, f.out = errors.New("exit status 1"), "Device not found.\n"
+
+	rec := httptest.NewRecorder()
+	handleCast(rec, httptest.NewRequest(http.MethodPost, "/api/devices/cast",
+		strings.NewReader(`{"name":" Lounge ","host":" 1.2.3.4 ","url":" http://dash/ "}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("cast = %d (%s)", rec.Code, rec.Body)
+	}
+
+	// Trimmed before the key is built: an untrimmed name filed the error under a
+	// key nothing else ever reads, so it never reached the device card.
+	dev := DeviceConfig{Name: "Lounge", Host: "1.2.3.4"}
+	waitFor(t, "the cast failure to be recorded", func() bool { return castError(dev) != "" })
+	if got := castError(dev); got != "Device not found." {
+		t.Errorf("castError = %q, want catt's explanation filed under the trimmed key", got)
+	}
+	casts, _ := f.recorded()
+	if len(casts) != 1 || casts[0].url != "http://dash/" {
+		t.Errorf("casts = %+v, want one cast of the trimmed URL", casts)
+	}
+}
+
+func TestCastAndStopHandlersRecordSuccess(t *testing.T) {
+	resetCastState()
+	f := withFakeCatt(t)
+	dev := DeviceConfig{Host: "1.2.3.4"}
+
+	rec := httptest.NewRecorder()
+	handleCast(rec, httptest.NewRequest(http.MethodPost, "/api/devices/cast",
+		strings.NewReader(`{"host":"1.2.3.4","url":"http://dash/"}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("cast = %d (%s)", rec.Code, rec.Body)
+	}
+	waitFor(t, "the cast to be recorded", func() bool { return isCasting(dev) })
+	if u, ok := lastCastURL(dev); !ok || u != "http://dash/" {
+		t.Errorf("lastCastURL = (%q, %v), want the manually cast URL", u, ok)
+	}
+
+	rec = httptest.NewRecorder()
+	handleStop(rec, httptest.NewRequest(http.MethodPost, "/api/devices/stop",
+		strings.NewReader(`{"host":"1.2.3.4"}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("stop = %d (%s)", rec.Code, rec.Body)
+	}
+	waitFor(t, "the stop to be recorded", func() bool { return !isCasting(dev) })
+	if _, ok := lastCastURL(dev); ok {
+		t.Error("a stop left a recorded URL behind — nothing of ours is on screen")
+	}
+	_, stops := f.recorded()
+	if len(stops) != 1 || stops[0] != "host:1.2.3.4" {
+		t.Errorf("stops = %v, want one, keyed by host", stops)
+	}
+}
+
+// waitFor polls until cond holds. /api/devices/cast and /stop answer *before*
+// catt has run, so their outcome is recorded after the response — and recording
+// it is the last thing those goroutines do, which makes waiting for the outcome
+// the only signal that also proves the goroutine has finished with the seams
+// t.Cleanup is about to restore under it.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
 // --- duplicate config rows --------------------------------------------------
 
 // Two rows can name one device — the same IP typed twice, or an IP filled into a
@@ -1088,6 +1555,37 @@ func TestConfigWarningFlagsDuplicateEntries(t *testing.T) {
 	// rows share the key "name:", and getLiveStatus already explains each.
 	if got := configWarning(DeviceConfig{}, "", true); got != "" {
 		t.Errorf("an unaddressed device is already reported, got %q", got)
+	}
+}
+
+// autoCastTargets claims a deviceKey for the first matching row before it looks
+// at that row's URL, so a duplicated pair whose *first* row has the unusable URL
+// is never cast at all. Leading with the duplicate advisory then told the user
+// that the first row was the one being cast — hiding the one problem they could
+// actually fix — so for an auto-cast row the URL comes first.
+func TestConfigWarningReportsAnUnusableURLAheadOfTheDuplicateNote(t *testing.T) {
+	first := DeviceConfig{Name: "First", Host: "1.2.3.4", URL: "not-a-url", AutoCast: true}
+	if got := configWarning(first, first.URL, true); !strings.Contains(got, "URL") {
+		t.Errorf("warning = %q, want the unusable URL named", got)
+	}
+	noURL := DeviceConfig{Name: "First", Host: "1.2.3.4", AutoCast: true}
+	if got := configWarning(noURL, "", true); !strings.Contains(got, "URL") {
+		t.Errorf("warning = %q, want the missing URL named", got)
+	}
+	// The row that is genuinely only inert because another row won the key still
+	// says so, which is what points at the row above.
+	second := DeviceConfig{Name: "Second", Host: "1.2.3.4", URL: "http://b/", AutoCast: true}
+	if got := configWarning(second, second.URL, true); !strings.Contains(got, "same device") {
+		t.Errorf("warning = %q, want the duplicate advisory", got)
+	}
+	// A no-IP auto-cast row that is *also* duplicated hears about the duplicate
+	// first: unlike the URL problems it is the reason nothing happens at all.
+	blind := DeviceConfig{Name: "Speaker", URL: "http://b/", AutoCast: true}
+	if got := configWarning(blind, blind.URL, true); !strings.Contains(got, "same device") {
+		t.Errorf("warning = %q, want the duplicate advisory ahead of the missing IP", got)
+	}
+	if got := configWarning(blind, blind.URL, false); !strings.Contains(got, "No IP") {
+		t.Errorf("warning = %q, want the missing IP once it is not duplicated", got)
 	}
 }
 
@@ -1722,6 +2220,199 @@ func TestHandleScanRefusesASecondScan(t *testing.T) {
 	// release it on that scan's behalf.
 	if !scanInFlight.Load() {
 		t.Error("refusing a second scan cleared the in-flight latch")
+	}
+}
+
+// --- the catt status parse --------------------------------------------------
+
+// `catt status` describes the *media* session, and a web page cast has none, so
+// for our own casts the output carries no state at all and the cached one is the
+// only answer there is. When the device does report one it is the device's own
+// truth and wins.
+func TestCattStatusState(t *testing.T) {
+	// The byte-identical output for "our dashboard is up" and "genuinely idle":
+	// two Volume lines and nothing else.
+	const webCast = "Volume: 100\nVolume muted: False\n"
+	if got := cattStatusState(webCast, true); got != "Playing" {
+		t.Errorf("state = %q, want the cached \"Playing\"", got)
+	}
+	if got := cattStatusState(webCast, false); got != "Idle" {
+		t.Errorf("state = %q, want the cached \"Idle\"", got)
+	}
+	// A media app does report one, and it beats our guess.
+	media := "Title: Something\nState: PAUSED\nVolume: 100\n"
+	if got := cattStatusState(media, true); got != "PAUSED" {
+		t.Errorf("state = %q, want the device's own PAUSED", got)
+	}
+	if got := cattStatusState(media, false); got != "PAUSED" {
+		t.Errorf("state = %q, want the device's own PAUSED even when we think it is idle", got)
+	}
+	// A bare "State: " says nothing. Taking it blanked the card's only state
+	// text, which reads as a UI fault rather than as the device saying nothing.
+	if got := cattStatusState("State: \nVolume: 100\n", true); got != "Playing" {
+		t.Errorf("state = %q, want an empty State line ignored", got)
+	}
+	// The label is matched with its space, so "State:" alone and the other five
+	// labels catt can print are all left alone.
+	for _, out := range []string{"State:\n", "Volume muted: False\n", "Remaining time: 12\n"} {
+		if got := cattStatusState(out, false); got != "Idle" {
+			t.Errorf("cattStatusState(%q) = %q, want the fallback", out, got)
+		}
+	}
+	// \r\n output must not leave the state with an invisible character stuck to
+	// the end, and the value is bounded like every other subprocess string.
+	if got := cattStatusState("State: BUFFERING\r\n", false); got != "BUFFERING" {
+		t.Errorf("state = %q, want the CR stripped", got)
+	}
+	long := cattStatusState("State: "+strings.Repeat("é", maxStatusTextLen*2), false)
+	if n := utf8.RuneCountInString(long); n != maxStatusTextLen+1 {
+		t.Errorf("an overlong state was not bounded: %d runes", n)
+	}
+	if !utf8.ValidString(long) {
+		t.Errorf("bounded state is not valid UTF-8: %q", long)
+	}
+}
+
+// --- the monitor's wait ------------------------------------------------------
+
+// The interval ceiling is a day, so a monitor that waits on the value read at the
+// top of the cycle applied a lowered interval up to 24h late and the save looked
+// like it had done nothing.
+func TestRemainingWaitTracksALoweredInterval(t *testing.T) {
+	withConfig(t, Config{CheckInterval: maxCheckInterval})
+
+	waitFrom := time.Now()
+	if d := remainingWait(waitFrom); d < 23*time.Hour {
+		t.Fatalf("remaining wait = %v, want most of a day", d)
+	}
+	cfgMu.Lock()
+	cfg.CheckInterval = minCheckInterval
+	cfgMu.Unlock()
+	if d := remainingWait(waitFrom); d > minCheckInterval*time.Second {
+		t.Errorf("remaining wait after lowering the interval = %v, want at most %ds", d, minCheckInterval)
+	}
+
+	// Measured from the start of the wait, so a burst of saves can only shorten
+	// it: once the interval has elapsed the answer stays non-positive however
+	// many times it is asked, and monitorLoop polls instead of waiting again.
+	if d := remainingWait(time.Now().Add(-time.Hour)); d > 0 {
+		t.Errorf("remaining wait for an elapsed interval = %v, want <= 0", d)
+	}
+}
+
+// --- the TCP scan ------------------------------------------------------------
+
+// The loopback /24: every host in it is local, so a probe to an unbound port is
+// refused instantly and no packet reaches the LAN. It exercises the fan-out, the
+// progress ticker and the final progress event without scanning anyone.
+const loopbackSubnet = "127.0.0"
+
+func TestTCPScanCompletesAndReportsEveryHost(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		statuses []string
+		progress [][2]int
+	)
+	devices, failure := tcpScan(context.Background(), []string{loopbackSubnet},
+		func(msg string) { mu.Lock(); statuses = append(statuses, msg); mu.Unlock() },
+		func(DiscoveredDevice) {},
+		func(checked, total int) { mu.Lock(); progress = append(progress, [2]int{checked, total}); mu.Unlock() },
+	)
+	if failure != "" {
+		t.Errorf("failure = %q, want none for an explicit subnet", failure)
+	}
+	// Loopback has no Chromecast on it; anything found would be a real service on
+	// 127.0.0.x:8008 answering eureka_info, which is not this test's business.
+	for _, d := range devices {
+		if !strings.HasPrefix(d.Host, loopbackSubnet+".") {
+			t.Errorf("scan reported a device outside the subnet it was given: %+v", d)
+		}
+	}
+	if len(statuses) != 1 || !strings.Contains(statuses[0], loopbackSubnet+".0/24") {
+		t.Errorf("statuses = %q, want one naming the subnet and the host count", statuses)
+	}
+	if !strings.Contains(statuses[0], "254") {
+		t.Errorf("status %q does not name the number of hosts", statuses[0])
+	}
+	// The ticker fires every 500ms, so the last event it emits is almost always
+	// short of the total — leaving the UI progress bar stuck below 100%. The
+	// final event is emitted explicitly once every host has been checked.
+	if len(progress) == 0 {
+		t.Fatal("no progress events at all")
+	}
+	last := progress[len(progress)-1]
+	if last[0] != 254 || last[1] != 254 {
+		t.Errorf("final progress = %d/%d, want 254/254", last[0], last[1])
+	}
+	for _, p := range progress {
+		if p[0] > p[1] {
+			t.Errorf("progress %d/%d exceeds the total", p[0], p[1])
+		}
+	}
+}
+
+// A client that navigates away cancels the request, and the remaining hosts must
+// not go on being probed with nobody listening.
+func TestTCPScanStopsWhenTheClientGivesUp(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	devices, failure := tcpScan(ctx, []string{loopbackSubnet},
+		func(string) {}, func(DiscoveredDevice) {}, func(int, int) {})
+	if len(devices) != 0 || failure != "" {
+		t.Errorf("cancelled scan = (%+v, %q), want nothing and no failure", devices, failure)
+	}
+}
+
+// The whole SSE contract in one pass: the ordered event types, counts that are
+// always present, and a terminating event the UI can read a result off.
+func TestHandleScanStreamsTheWholeTCPPath(t *testing.T) {
+	rec := httptest.NewRecorder()
+	handleScan(rec, httptest.NewRequest(http.MethodGet, "/api/devices/scan?subnet="+loopbackSubnet+".0/24", nil))
+
+	events := sseEvents(t, rec.Body.String())
+	if len(events) < 2 {
+		t.Fatalf("events = %+v, want at least a status and a done", events)
+	}
+	first, last := events[0], events[len(events)-1]
+	if first.Type != "status" {
+		t.Errorf("first event = %+v, want the probing status", first)
+	}
+	if last.Type != "done" {
+		t.Errorf("last event = %+v, want done", last)
+	}
+	if last.Message != "" {
+		t.Errorf("done carried a failure for an explicit subnet: %q", last.Message)
+	}
+	var progressed, found int
+	for _, e := range events {
+		switch e.Type {
+		case "progress":
+			progressed++
+			if e.Total != 254 {
+				t.Errorf("progress event total = %d, want 254", e.Total)
+			}
+		case "found":
+			found++
+			if e.Device == nil || e.Device.Host == "" {
+				t.Errorf("found event with no device: %+v", e)
+			}
+		}
+	}
+	if progressed == 0 {
+		t.Error("no progress events — the UI bar would never move")
+	}
+	if last.Count != found {
+		t.Errorf("done count = %d but %d found events were sent", last.Count, found)
+	}
+	// The latch must be released whatever happened, or every later scan is
+	// refused for the rest of the process lifetime.
+	if scanInFlight.Load() {
+		t.Error("a completed scan left scanInFlight set")
+	}
+	// An explicit subnet skips catt entirely — which is why this test can run at
+	// all, and why it must never be given one that reaches the real LAN.
+	if strings.Contains(rec.Body.String(), "mDNS") {
+		t.Error("an explicit subnet should not have run the mDNS scan")
 	}
 }
 

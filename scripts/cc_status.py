@@ -62,6 +62,20 @@ def emit(payload):
         return True
 
 
+def device_is_idle(app_id, is_stand_by):
+    """Decide whether the device counts as having nothing of ours on screen.
+
+    Treat an empty app_id like a missing one: some devices report "" rather than
+    None when nothing is running, and `app_id is None` alone let that read as
+    playing — the monitor then never re-cast the dashboard. Backdrop is the
+    screensaver, so a device showing it is idle too; offering its id to the Go
+    side's app-id learner would teach the screensaver as our dashboard.
+
+    A separate function so the rule is testable without a device or pychromecast.
+    """
+    return bool(is_stand_by) or not app_id or app_id == BACKDROP_APP_ID
+
+
 def reachable(host):
     """Cheap TCP check before handing off to pychromecast.
 
@@ -118,10 +132,7 @@ def main():
         # calls itself, it is rendered straight onto the device card, and nothing
         # in the protocol says how long it may be.
         display_name = clip(s.display_name, MAX_MESSAGE)
-        # Treat an empty app_id like a missing one: some devices report "" rather
-        # than None when nothing is running, and `app_id is None` alone let that
-        # read as playing — the monitor then never re-cast the dashboard.
-        is_idle = bool(s.is_stand_by) or not app_id or app_id == BACKDROP_APP_ID
+        is_idle = device_is_idle(app_id, s.is_stand_by)
 
         # volume_level/volume_muted are None until the first status update lands.
         volume_level = round(s.volume_level, 2) if s.volume_level is not None else None

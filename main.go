@@ -608,6 +608,11 @@ func duplicateDeviceKeys(devices []DeviceConfig) map[string]bool {
 	return dup
 }
 
+// duplicateEntryWarning is emitted for every row of a duplicated pair, from two
+// different places in configWarning — the position of this one advisory relative
+// to the URL checks is the difference between the two.
+const duplicateEntryWarning = "Another entry points at the same device — they share one cast state, and only the first is auto-cast."
+
 // configWarning reports an advisory problem with how a device is configured.
 // url is the device's effective cast URL: "nothing to cast" is a property of the
 // device and the global default together, not of the device alone. duplicate
@@ -618,22 +623,33 @@ func configWarning(dev DeviceConfig, url string, duplicate bool) string {
 	if dev.Name == "" && dev.Host == "" {
 		return "" // getLiveStatus already explains this one; do not pile on
 	}
-	// Ahead of the auto-cast gate below, because sharing a deviceKey costs
-	// something either way: both rows report the same state and the same cast
-	// error, so a failure on one is rendered on both.
-	if duplicate {
-		return "Another entry points at the same device — they share one cast state, and only the first is auto-cast."
-	}
 	if !dev.AutoCast {
+		// Reported even with nothing monitoring the device, because sharing a
+		// deviceKey costs something either way: both rows report the same state
+		// and the same cast error, so a failure on one is rendered on both.
+		if duplicate {
+			return duplicateEntryWarning
+		}
 		return "" // nothing is monitoring it, so there is nothing to warn about
 	}
 	// monitorDevices skips both of the next two cases, and a skip is invisible:
 	// from the UI it is indistinguishable from auto-cast simply not working.
+	//
+	// Reported *ahead* of the duplicate advisory below, unlike for a device with
+	// auto-cast off: these two stop the device being cast at all, whereas the
+	// duplicate note only says which row does the casting. autoCastTargets claims
+	// the deviceKey for the first matching row before it looks at that row's URL,
+	// so a duplicated pair whose first row has the unusable URL is never cast —
+	// and leading with "only the first is auto-cast" told the user the first row
+	// was working while hiding the one problem they could actually fix.
 	if url == "" {
 		return "No URL for this device and no default URL — auto-cast has nothing to cast."
 	}
 	if !castableURL(url) {
 		return "URL is not an absolute http:// or https:// address — auto-cast cannot use it."
+	}
+	if duplicate {
+		return duplicateEntryWarning
 	}
 	// An auto-cast device with no IP cannot be monitored at all. `catt status`
 	// reports the *media* session, and a web page cast has none, so its output is
@@ -689,7 +705,7 @@ func getLiveStatus(ctx context.Context, dev DeviceConfig) DeviceStatus {
 		return DeviceStatus{Name: dev.Name, Host: dev.Host, State: "unknown", Error: "device has no name or IP address"}
 	}
 	if dev.Host != "" {
-		return getPychromecastStatus(ctx, dev)
+		return probeDevice(ctx, dev)
 	}
 	// Fall back to catt when no host IP is configured.
 	args := append(cattDeviceArgs(dev), "status")
@@ -699,28 +715,42 @@ func getLiveStatus(ctx context.Context, dev DeviceConfig) DeviceStatus {
 		ds.Error = cattFailure(err, out)
 		return ds
 	}
-	if isCasting(dev) {
-		ds.State = "Playing"
-	} else {
-		ds.State = "Idle"
+	ds.State = cattStatusState(out, isCasting(dev))
+	return ds
+}
+
+// cattStatusState reads a device state out of `catt status` output, falling back
+// to casting — our own cached cast state — when the output says nothing about it,
+// which for a web-page cast is always (see the discussion in CLAUDE.md).
+//
+// Only "State: " is worth looking for. catt's status output has exactly six
+// labels — Title, Time, Remaining time, State, Volume, Volume muted — so the
+// "Content: " line this used to also parse never existed, and the URL it filled
+// in was never set by anything or read by anyone.
+//
+// That line is narrow but real: catt includes player_state only when the media
+// session reports a non-image content_type, which our own cast_site never does
+// (hence the cached fallback), but a media app can. When it is there it is the
+// device's own truth — PAUSED, BUFFERING — so it wins over our guess.
+//
+// Pure, so the parse is testable without catt.
+func cattStatusState(out string, casting bool) string {
+	state := "Idle"
+	if casting {
+		state = "Playing"
 	}
-	// Only "State: " is worth looking for. catt's status output has exactly six
-	// labels — Title, Time, Remaining time, State, Volume, Volume muted — so the
-	// "Content: " line this used to also parse never existed, and the URL it
-	// filled in was never set by anything or read by anyone.
-	//
-	// This line is narrow but real: catt includes player_state only when the media
-	// session reports a non-image content_type, which our own cast_site never does
-	// (hence the cached fallback above), but a media app can. When it is there it
-	// is the device's own truth — PAUSED, BUFFERING — so it wins over our guess.
 	for _, line := range splitLines(out) {
 		if after, ok := strings.CutPrefix(line, "State: "); ok {
 			// Bounded: this comes off a 64KB buffer, and a line with no newline in
-			// it is all one "value".
-			ds.State = shortText(after)
+			// it is all one "value". Ignored when empty — catt printing a bare
+			// "State: " would otherwise blank the card's only state text, which
+			// reads as a UI fault rather than as the device saying nothing.
+			if s := shortText(after); s != "" {
+				state = s
+			}
 		}
 	}
-	return ds
+	return state
 }
 
 // splitLines splits subprocess output into lines.
@@ -929,6 +959,25 @@ func autoCastTargets(devices []DeviceConfig, defaultURL string) []DeviceConfig {
 	return targets
 }
 
+// The three subprocess calls the casting logic makes, behind function variables.
+//
+// monitorDevices is the only code that both probes a device and decides whether
+// to cast to it, so none of its ordering — the stale-URL re-cast, the takeover
+// gate, the skip on an unreachable device — could be exercised at all while it
+// shelled out directly; the same went for the goroutines in /api/devices/cast and
+// /stop, which are where a cast failure becomes a castErrors entry. Plain
+// variables rather than an interface: there is exactly one production
+// implementation of each, and only the tests ever substitute one.
+var (
+	probeDevice = getPychromecastStatus
+	castSite    = func(ctx context.Context, dev DeviceConfig, url string) (string, error) {
+		return runCatt(ctx, 30*time.Second, append(cattDeviceArgs(dev), "cast_site", url)...)
+	}
+	stopCast = func(ctx context.Context, dev DeviceConfig) (string, error) {
+		return runCatt(ctx, 15*time.Second, append(cattDeviceArgs(dev), "stop")...)
+	}
+)
+
 func monitorDevices(ctx context.Context) {
 	cfgMu.RLock()
 	devices := append([]DeviceConfig{}, cfg.Devices...)
@@ -951,7 +1000,7 @@ func monitorDevices(ctx context.Context) {
 			// timeout failing, serially, and a couple of powered-off TVs were
 			// enough to keep the loop permanently busy and starve the devices
 			// that were actually up.
-			st := getPychromecastStatus(ctx, dev)
+			st := probeDevice(ctx, dev)
 			if st.Error != "" {
 				log.Printf("skipping auto-cast to %q: %s", deviceLabel(dev), st.Error)
 				continue
@@ -986,8 +1035,7 @@ func monitorDevices(ctx context.Context) {
 			log.Printf("taking %q back from another app", deviceLabel(dev))
 		}
 		log.Printf("auto-casting to %q: %s", deviceLabel(dev), url)
-		args := append(cattDeviceArgs(dev), "cast_site", url)
-		out, err := runCatt(ctx, 30*time.Second, args...)
+		out, err := castSite(ctx, dev, url)
 		if err != nil {
 			log.Printf("cast error for %q: %v — %s", deviceLabel(dev), err, strings.TrimSpace(out))
 			setCastError(dev, cattFailure(err, out))
@@ -1016,21 +1064,28 @@ func checkInterval() time.Duration {
 	return time.Duration(interval) * time.Second
 }
 
+// remainingWait is how much of the current check interval monitorLoop still has
+// to wait out, for a cycle whose wait began at waitFrom.
+//
+// It re-reads the interval on every call instead of sleeping on the value read
+// once at the top of the cycle. The ceiling is a day, so lowering the interval
+// from anywhere near it took effect only after the *old* interval had elapsed —
+// up to 24h during which the save looked like it had done nothing at all.
+//
+// Measured from waitFrom rather than from the wake-up, so a burst of saves can
+// only shorten the wait towards zero and can never postpone the next poll.
+//
+// Pure enough to test: no sleeping, so the 24h-to-10s case is a direct assertion.
+func remainingWait(waitFrom time.Time) time.Duration {
+	return time.Until(waitFrom.Add(checkInterval()))
+}
+
 func monitorLoop() {
 	for {
 		monitorDevices(context.Background())
 		waitFrom := time.Now()
-		// Re-read the interval whenever the config changes instead of sleeping on
-		// the value read once here. The ceiling is a day, so lowering the interval
-		// from anywhere near it took effect only after the *old* interval had
-		// elapsed — up to 24h during which the save looked like it had done
-		// nothing at all.
-		//
-		// The deadline is measured from waitFrom rather than from each wake-up, so
-		// repeated saves shorten the wait towards zero and can never postpone the
-		// next poll.
 		for {
-			d := time.Until(waitFrom.Add(checkInterval()))
+			d := remainingWait(waitFrom)
 			if d <= 0 {
 				break
 			}
@@ -1234,7 +1289,7 @@ func isVirtualIface(name string) bool {
 // localSubnets returns the /24 base (e.g. "192.168.1") for each usable private
 // IPv4 interface, preferring physical ones.
 func localSubnets() []string {
-	physical, all := collectSubnets(true), collectSubnets(false)
+	physical := collectSubnets(true)
 	// Fall back to the unfiltered set rather than returning nothing: the prefix
 	// list is a heuristic, and on an unusual host it could filter out the only
 	// interface there is.
@@ -1244,8 +1299,12 @@ func localSubnets() []string {
 	// fact about the address, not a guess about a name, and undoing it is exactly
 	// what would fire on the hosts that need it most (see below). A host with
 	// nothing private on it correctly auto-detects nothing.
+	//
+	// Only walked when the filtered pass came back empty: enumerating every
+	// interface and its addresses twice on every call bought nothing, and
+	// /api/subnets is on the page-load path.
 	if len(physical) == 0 {
-		return all
+		return collectSubnets(false)
 	}
 	return physical
 }
@@ -1330,7 +1389,10 @@ type ScanEvent struct {
 func parseSubnet(s string) string {
 	s = strings.TrimSpace(s)
 	if idx := strings.Index(s, "/"); idx != -1 {
-		s = s[:idx] // strip CIDR mask, leaving bare host address
+		// Trim again after the cut: "192.168.1.0 / 24" leaves a trailing space,
+		// which neither net.ParseIP nor the Atoi loop below accepts, so a subnet
+		// typed with spaces around the mask was refused as "Invalid subnet".
+		s = strings.TrimSpace(s[:idx]) // strip CIDR mask, leaving bare host address
 	}
 	if ip := net.ParseIP(s); ip != nil {
 		if v4 := ip.To4(); v4 != nil {
@@ -1679,11 +1741,10 @@ func handleCast(w http.ResponseWriter, r *http.Request) {
 	}
 	go func() {
 		dev := DeviceConfig{Name: req.Name, Host: req.Host}
-		args := append(cattDeviceArgs(dev), "cast_site", req.URL)
 		// context.Background, not r.Context: this outlives the response we are
 		// about to write, and the request context is cancelled the moment the
 		// handler returns.
-		out, err := runCatt(context.Background(), 30*time.Second, args...)
+		out, err := castSite(context.Background(), dev, req.URL)
 		if err != nil {
 			log.Printf("cast %q -> %s: %v — %s", deviceLabel(dev), req.URL, err, strings.TrimSpace(out))
 			setCastError(dev, cattFailure(err, out))
@@ -1717,8 +1778,7 @@ func handleStop(w http.ResponseWriter, r *http.Request) {
 	}
 	go func() {
 		dev := DeviceConfig{Name: req.Name, Host: req.Host}
-		args := append(cattDeviceArgs(dev), "stop")
-		out, err := runCatt(context.Background(), 15*time.Second, args...)
+		out, err := stopCast(context.Background(), dev)
 		if err != nil {
 			log.Printf("stop %q: %v — %s", deviceLabel(dev), err, strings.TrimSpace(out))
 			setCastError(dev, cattFailure(err, out))
