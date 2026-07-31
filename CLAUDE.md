@@ -212,6 +212,22 @@ old URL was skipped forever and editing `default_url` looked like a no-op. Only
 a cast of ours writes it — a device merely *observed* playing gets no entry, so
 one already up when the process starts is left alone rather than restarted.
 
+A live `castErrors` entry is the *third* reason to cast, alongside "idle" and
+"stale URL", and it is the one that covers a cast that failed over a page still on
+screen. That is the normal shape of the failure for an always-on dashboard:
+`cast_site` fails, the page it was replacing is still up, and the next probe duly
+reports the device as playing. `setCastError` has already dropped the `castURLs`
+entry, so nothing says the page is stale, and "playing, not foreign, not stale" is
+the skip — the device was then never touched again for the life of the process.
+Which is also why an observation *never* clears a `castErrors` entry, playing or
+idle: "playing something" is not evidence that our cast worked, and clearing there
+left the monitor unable to tell the page it asked for from the page it failed to
+replace. Only `setCastState` clears one, so the reason stands until an action of
+ours actually succeeds. The cost is that a device nothing is auto-casting keeps a
+red error on its card next to a healthy "Playing" until someone casts to it
+again — which is the accurate report of what happened, and much the cheaper of the
+two failure modes.
+
 `castObserved` does the same for polls against *each other*:
 `/api/devices/status` and the monitor probe the same device independently, so
 whichever started earlier can easily finish later. Any new timestamped state

@@ -236,7 +236,18 @@ func lastCastURL(dev DeviceConfig) (string, bool) {
 // event: a poll that finds the device idle is usually the *consequence* of the
 // failed cast, and clearing the error there erased it before
 // getDeviceStatus could merge it in — every failure read as a plain "Idle".
-// An observed *playing* device does mean the last error is stale, so drop it.
+//
+// A *playing* observation does not clear it either, which is the less obvious
+// half. "The device is playing something" is not evidence that our cast
+// succeeded — a failed cast usually leaves the previous page up, and the poll
+// that follows sees exactly that. Clearing there both wiped the reason and, worse,
+// left monitorDevices with nothing to distinguish "playing the page we asked for"
+// from "playing the page we failed to replace", so it skipped the device on every
+// tick from then on. Only an action of ours succeeding says the error is stale, so
+// only setCastState clears it. For an auto-cast device that is the very next
+// tick's retry; for one nothing is monitoring, the card keeps a red error beside a
+// healthy "Playing" until somebody casts to it again — an accurate report of what
+// last happened, and much the cheaper of the two failure modes.
 //
 // observedAt is when the poll *began*, not when it finished: a probe takes
 // seconds, so one started before a cast can land after it and would otherwise
@@ -284,9 +295,6 @@ func observeCastState(dev DeviceConfig, playing bool, appID string, observedAt t
 		}
 	}
 	castStates[k] = playing
-	if playing {
-		delete(castErrors, k)
-	}
 	return true
 }
 
@@ -717,8 +725,7 @@ func getLiveStatus(ctx context.Context, dev DeviceConfig) DeviceStatus {
 		return probeDevice(ctx, dev)
 	}
 	// Fall back to catt when no host IP is configured.
-	args := append(cattDeviceArgs(dev), "status")
-	out, err := runCatt(ctx, 10*time.Second, args...)
+	out, err := cattStatus(ctx, dev)
 	ds := DeviceStatus{Name: dev.Name, Host: dev.Host, State: "unknown"}
 	if err != nil {
 		ds.Error = cattFailure(err, out)
@@ -1013,7 +1020,17 @@ var (
 	// drove the no-subnet path through it would scan the LAN of the machine
 	// running it. tcpScan itself is exercised directly, against loopback.
 	tcpScanner = tcpScan
-	castSite   = func(ctx context.Context, dev DeviceConfig, url string) (string, error) {
+	// cattStatus is the status query for a device with no IP, and the last
+	// subprocess left in getLiveStatus. Seamed for the same reason as the rest:
+	// both halves of that branch's contract — that a failure is explained rather
+	// than reported as an empty error, and that the parse falls back to our own
+	// cached cast state because catt says nothing about a web-page cast — were
+	// unassertable in a test that may not run catt, so getting either wrong looked
+	// exactly like a device that had simply gone quiet.
+	cattStatus = func(ctx context.Context, dev DeviceConfig) (string, error) {
+		return runCatt(ctx, 10*time.Second, append(cattDeviceArgs(dev), "status")...)
+	}
+	castSite = func(ctx context.Context, dev DeviceConfig, url string) (string, error) {
 		return runCatt(ctx, 30*time.Second, append(cattDeviceArgs(dev), "cast_site", url)...)
 	}
 	stopCast = func(ctx context.Context, dev DeviceConfig) (string, error) {
@@ -1065,14 +1082,34 @@ func monitorDevices(ctx context.Context) {
 		if prev, ok := lastCastURL(dev); ok && prev != url {
 			stale = true
 		}
+		// A cast of ours that failed has to be retried, and the skip below is what
+		// stopped it being: a failed cast usually leaves whatever was on screen
+		// beforehand still on screen, so the next probe reports the device as
+		// playing — and setCastError has already dropped the castURLs entry that
+		// would have made it read as stale. The device then matched "playing, and
+		// nothing says it is stale" on every subsequent tick and was never touched
+		// again: an always-on dashboard left on a page we failed to replace, with
+		// the reason wiped by that same observation — which used to clear the error
+		// whenever it found the device playing — and a card reading a clean
+		// "Playing".
+		//
+		// "Playing something" is not evidence that our cast worked. Only an action
+		// of ours succeeding is, and that is exactly what a castErrors entry says
+		// did not happen. A retry per tick is the same cadence an idle device
+		// already gets, and a success clears the entry.
+		retry := castError(dev) != ""
 		// A foreign app sets the cast state too (isCasting means "playing
 		// something", not "playing ours"), so it must not short-circuit a
 		// takeover that the check above has already approved.
 		if isCasting(dev) && !foreign {
-			if !stale {
+			switch {
+			case stale:
+				log.Printf("re-casting %q: URL changed", deviceLabel(dev))
+			case retry:
+				log.Printf("re-casting %q: the last cast failed", deviceLabel(dev))
+			default:
 				continue
 			}
-			log.Printf("re-casting %q: URL changed", deviceLabel(dev))
 		}
 		if foreign {
 			log.Printf("taking %q back from another app", deviceLabel(dev))
@@ -1165,6 +1202,24 @@ func rejectBody(w http.ResponseWriter, err error) {
 	http.Error(w, err.Error(), http.StatusBadRequest)
 }
 
+// decodeOneObject decodes exactly one JSON value from body into v and refuses
+// anything that follows it. Decode stops at the end of the first value and
+// ignores the rest, so a body that was concatenated or double-encoded — two
+// requests joined by a retrying client, a proxy appending to the stream — had
+// its first half acted on and the second silently dropped, with a 200 returned
+// for the whole thing. Every endpoint here replaces or acts on the *whole*
+// payload, so a partial one must be refused rather than half-applied.
+func decodeOneObject(body io.Reader, v any) error {
+	dec := json.NewDecoder(body)
+	if err := dec.Decode(v); err != nil {
+		return err
+	}
+	if dec.More() {
+		return errors.New("unexpected content after the JSON object")
+	}
+	return nil
+}
+
 func handleConfig(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -1188,22 +1243,16 @@ func handleConfig(w http.ResponseWriter, r *http.Request) {
 		// every device deleted from disk and every cast state pruned, and got a
 		// 200 for it. This endpoint replaces the whole config, so it must not
 		// treat "no value" as "the empty value".
-		dec := json.NewDecoder(r.Body)
+		//
+		// Anything after that object is refused too (see decodeOneObject): the half
+		// that would be dropped here is a device list.
 		var decoded *Config
-		if err := dec.Decode(&decoded); err != nil {
+		if err := decodeOneObject(r.Body, &decoded); err != nil {
 			rejectBody(w, err)
 			return
 		}
 		if decoded == nil {
 			http.Error(w, "config body must be a JSON object", http.StatusBadRequest)
-			return
-		}
-		// Decode stops at the end of the first value and ignores whatever follows,
-		// so a body that was concatenated or double-encoded applied its first half
-		// silently — and the half that was dropped is a device list. Refuse it
-		// rather than persist a partial config the caller never sent.
-		if dec.More() {
-			http.Error(w, "unexpected content after the config object", http.StatusBadRequest)
 			return
 		}
 		newCfg := *decoded
@@ -1763,7 +1812,7 @@ func handleCast(w http.ResponseWriter, r *http.Request) {
 		Host string `json:"host"`
 		URL  string `json:"url"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeOneObject(r.Body, &req); err != nil {
 		rejectBody(w, err)
 		return
 	}
@@ -1827,7 +1876,7 @@ func handleStop(w http.ResponseWriter, r *http.Request) {
 		Name string `json:"name"`
 		Host string `json:"host"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeOneObject(r.Body, &req); err != nil {
 		rejectBody(w, err)
 		return
 	}

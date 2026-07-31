@@ -299,6 +299,46 @@ class MainTest(unittest.TestCase):
         self.assertIn("no status received", payload["error"])
         self.assertIn("192.0.2.1", payload["error"])
 
+    def test_the_watchdog_explains_itself_before_killing_the_process(self):
+        # on_timeout is the riskiest branch in the script and the only one no other
+        # test reaches: it runs when something inside pychromecast blocks past its
+        # own timeouts, and it has to leave a parseable diagnosis on stdout before
+        # it goes. A process that exits with an empty pipe reaches the Go side as
+        # "signal: killed" — or, worse, as no output at all — and the device card
+        # then explains nothing.
+        #
+        # os._exit is what makes it untestable where it stands (it skips the
+        # interpreter's shutdown, test runner included), so it is patched out and
+        # the callback the script registered is invoked directly.
+        callbacks = []
+        real_timer = threading.Timer
+
+        def record_timer(interval, fn):
+            callbacks.append(fn)
+            return real_timer(interval, fn)
+
+        with mock.patch.object(threading, "Timer", record_timer):
+            with mock.patch.object(cc_status, "reachable", return_value=False):
+                code, _ = self.run_main(["cc_status.py", "192.0.2.1"])
+        self.assertEqual(code, 1)
+        self.assertEqual(len(callbacks), 1, "the watchdog was never armed")
+
+        # Fresh pipe and latch: when the watchdog really fires, nothing has been
+        # emitted yet — that is precisely why it is the one doing the talking.
+        self.stdout.truncate(0)
+        self.stdout.seek(0)
+        cc_status._emitted = False
+        with mock.patch.object(cc_status.os, "_exit") as killed:
+            callbacks[0]()
+        # Non-zero, and _exit rather than sys.exit: a disconnect that is already
+        # wedged is exactly what this is escaping, so the finally block must not
+        # get a chance to run.
+        killed.assert_called_once_with(1)
+        payload = json.loads(self.stdout.getvalue())
+        self.assertIn("timed out", payload["error"])
+        self.assertIn("192.0.2.1", payload["error"])
+        self.assertIn(str(cc_status.OVERALL_TIMEOUT), payload["error"])
+
     def test_a_failure_always_carries_a_message(self):
         # Some exceptions stringify to "" (bare socket errors do). An empty
         # "error" reads as success on the Go side, which then reports the device
