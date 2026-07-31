@@ -58,11 +58,13 @@ def reachable(host):
 
 
 def main():
-    if len(sys.argv) < 2:
+    # An *empty* host is rejected alongside a missing one. socket.create_connection
+    # resolves "" to the loopback interface, so a blank argument would sail
+    # through reachable() and report this container's own state as the device's.
+    host = sys.argv[1].strip() if len(sys.argv) > 1 else ""
+    if not host:
         emit({"error": "usage: cc_status.py <host>"})
         sys.exit(1)
-
-    host = sys.argv[1]
 
     # Backstop for anything in pychromecast that blocks past its own timeouts.
     # os._exit skips the finally block below on purpose: a disconnect that is

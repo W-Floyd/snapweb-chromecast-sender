@@ -227,6 +227,21 @@ func TestCastStateKeyedByHost(t *testing.T) {
 	}
 }
 
+// A device needs only one of name and host, and a host-only entry is the
+// recommended configuration under Docker. Logging dev.Name alone printed
+// `auto-casting to ""` for exactly those devices.
+func TestDeviceLabelFallsBackToHost(t *testing.T) {
+	if got := deviceLabel(DeviceConfig{Name: "Lounge", Host: "1.2.3.4"}); got != "Lounge" {
+		t.Errorf("deviceLabel = %q, want the name", got)
+	}
+	if got := deviceLabel(DeviceConfig{Host: "1.2.3.4"}); got != "1.2.3.4" {
+		t.Errorf("deviceLabel = %q, want the host", got)
+	}
+	if got := deviceLabel(DeviceConfig{}); got == "" {
+		t.Error("deviceLabel of an unaddressed device must still name something")
+	}
+}
+
 func TestCastErrorRecordedAndCleared(t *testing.T) {
 	resetCastState()
 
@@ -483,6 +498,30 @@ func TestIdleObservationDisarmsTheAppLearner(t *testing.T) {
 	// The flag must still do its job when the cast does stick.
 	resetCastState()
 	learnCastApp(t, a, "84912283")
+}
+
+// The learn flag is consumed by the first applied poll after our cast, even one
+// that reports the device playing something it cannot name. cc_status.py never
+// produces that pair today (an empty app_id is reported as idle), but the flag
+// surviving a poll is precisely the hours-later mislearn that armed-forever
+// caused, so it must not depend on an invariant in another language.
+func TestUnidentifiableAppAlsoDisarmsTheLearner(t *testing.T) {
+	resetCastState()
+	a := DeviceConfig{Name: "Lounge", Host: "1.2.3.4"}
+	b := DeviceConfig{Name: "Kitchen", Host: "5.6.7.8"}
+
+	for _, dev := range []DeviceConfig{a, b} {
+		setCastState(dev, true) // arms the learn flag
+		// Playing, but with no app id to attribute it to.
+		if !observeCastState(dev, true, "", time.Now()) {
+			t.Fatal("a fresh observation should be applied")
+		}
+		// Somebody starts Netflix on it later.
+		observeCastState(dev, true, "CA5E9605", time.Now())
+	}
+	if isForeignApp("84912283") {
+		t.Error("an unnameable app left the learner armed, and someone else's app became ours")
+	}
 }
 
 func TestLimitedBufferKeepsThePrefixAndClaimsTheWholeWrite(t *testing.T) {

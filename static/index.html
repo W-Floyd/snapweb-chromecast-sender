@@ -13,7 +13,10 @@
 <body class="bg-slate-900 text-slate-100 min-h-screen" x-data="app()" x-init="init()" x-cloak>
 
   <!-- Notification toast -->
-  <div x-show="notification" x-transition
+  <!-- Hidden by clearing `show`, not by dropping the whole object: nulling it
+       emptied msg and reset type at the instant the fade-out began, so an error
+       toast spent its exit transition blank and green. -->
+  <div x-show="notification?.show" x-transition
        :class="notification?.type === 'error' ? 'bg-red-600' : 'bg-emerald-600'"
        class="fixed top-4 right-4 z-50 max-w-sm px-4 py-2.5 rounded-lg shadow-xl text-white font-medium text-sm break-words"
        x-text="notification?.msg">
@@ -407,7 +410,11 @@
                 break
               case 'done':
                 this.scanning = false
-                this.scanProgress = null
+                // Keep the last progress event rather than clearing it. The
+                // server emits a final one once every host has been checked,
+                // specifically so the bar is not left short of 100% — and
+                // nulling it here threw that away, so the bar vanished at
+                // whatever the 500ms ticker last happened to report.
                 es.close()
                 // A message on the done event is the server explaining why it
                 // stopped (bad subnet, scan already running). Prefer it — the
@@ -528,11 +535,16 @@
         // that failed read "Casting to 0 of 3 devices" and nothing else: the
         // per-device toasts are suppressed, and each would have overwritten the
         // last in any case, so the explanation was lost entirely.
+        //
+        // Any failure makes the whole toast red. Colouring on "at least one
+        // worked" put a green toast on "Casting to 1 of 3 devices — no URL set
+        // for Kitchen", so the only thing that had actually gone wrong was
+        // styled as success.
         batchSummary(verb, results) {
           const n = results.filter(r => r.ok).length
           const failed = results.find(r => !r.ok)
           const msg = `${verb} ${n} of ${results.length} device${results.length !== 1 ? 's' : ''}`
-          return { msg: failed ? `${msg} — ${failed.error}` : msg, ok: n > 0 }
+          return { msg: failed ? `${msg} — ${failed.error}` : msg, ok: !failed }
         },
 
         async castAll() {
@@ -550,12 +562,14 @@
         },
 
         notify(msg, type = 'success') {
-          this.notification = { msg, type }
+          this.notification = { msg, type, show: true }
           // Reset the timer on each notification — otherwise an earlier toast's
           // pending timeout clears a newer one after only a fraction of its life
           // (very visible during Cast All / Stop All).
           clearTimeout(this._notifyTimer)
-          this._notifyTimer = setTimeout(() => this.notification = null, 3500)
+          this._notifyTimer = setTimeout(() => {
+            if (this.notification) this.notification.show = false
+          }, 3500)
         },
       }
     }

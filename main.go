@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -155,6 +156,23 @@ func deviceKey(dev DeviceConfig) string {
 	return "name:" + dev.Name
 }
 
+// deviceLabel names a device for a log line. A device needs only *one* of name
+// and host to be castable, and a host-only entry is the configuration this
+// service recommends — `catt -d <ip>` bypasses mDNS, which does not work under
+// Docker bridge networking at all. Logging dev.Name alone therefore produced
+// `auto-casting to ""` and `cast error for ""` for precisely the devices the
+// monitor handles best, with nothing in the line to say which one it meant.
+// The UI carries the same helper, for the same reason.
+func deviceLabel(dev DeviceConfig) string {
+	if dev.Name != "" {
+		return dev.Name
+	}
+	if dev.Host != "" {
+		return dev.Host
+	}
+	return "unnamed device"
+}
+
 // setCastState records the outcome of a successful cast/stop, and clears any
 // error left by a previous failed attempt on the same device.
 func setCastState(dev DeviceConfig, playing bool) {
@@ -196,28 +214,33 @@ func observeCastState(dev DeviceConfig, playing bool, appID string, observedAt t
 		return false // an overlapping poll already reported a later view
 	}
 	castObserved[k] = observedAt
-	if playing && appID != "" && castLearnPending[k] {
-		if castAppCandidate == appID {
-			learnedCastApp = appID
-		} else {
-			// Disagreement, so this is a first sighting: hold it as a candidate
-			// and trust nothing until a second cast confirms it. Clearing the
-			// trusted value matters as much as not setting one — if the stored id
-			// was the mistake, dropping it lets casting resume, which is the only
-			// thing that can produce the observation that corrects it.
-			castAppCandidate = appID
-			learnedCastApp = ""
+	if castLearnPending[k] {
+		// The flag is consumed by the *first* applied poll after our cast, whatever
+		// that poll found. Disarming unconditionally is the point: left armed it
+		// never expired, and an hours-later poll — by which time somebody had
+		// started their own app — claimed that app as ours. A cast can exit 0
+		// without the dashboard sticking, and the next tick re-casts an idle device
+		// and re-arms this anyway, so there is nothing to lose by dropping it.
+		//
+		// Unconditional rather than only on `!playing`, because "playing something
+		// we cannot name" is no more evidence than "idle" is. That case rests
+		// today on an invariant in cc_status.py (an empty app_id is reported as
+		// idle); keeping the flag armed for it would make a drift over there
+		// reappear here as the mislearn this exists to prevent.
+		delete(castLearnPending, k)
+		if playing && appID != "" {
+			if castAppCandidate == appID {
+				learnedCastApp = appID
+			} else {
+				// Disagreement, so this is a first sighting: hold it as a candidate
+				// and trust nothing until a second cast confirms it. Clearing the
+				// trusted value matters as much as not setting one — if the stored id
+				// was the mistake, dropping it lets casting resume, which is the only
+				// thing that can produce the observation that corrects it.
+				castAppCandidate = appID
+				learnedCastApp = ""
+			}
 		}
-		delete(castLearnPending, k)
-	} else if !playing {
-		// Nothing of ours ended up running, so disarm the flag for the same reason
-		// setCastError does: the next app to appear on this device belongs to
-		// somebody else. Left armed it never expired, and an *hours later* poll —
-		// after someone had started their own app — claimed that app as ours.
-		// A cast can exit 0 without the dashboard sticking, and the very next tick
-		// re-casts an idle device and re-arms this anyway, so there is nothing to
-		// lose by dropping it.
-		delete(castLearnPending, k)
 	}
 	castStates[k] = playing
 	if playing {
@@ -457,7 +480,20 @@ func runCatt(ctx context.Context, timeout time.Duration, args ...string) (string
 	// no deadline of its own — wedging the monitor loop, or leaking a status
 	// request's goroutine, permanently.
 	cmd.WaitDelay = 5 * time.Second
-	out, err := cmd.CombinedOutput()
+	// Bound what we buffer, for the same reason getPychromecastStatus does:
+	// CombinedOutput grows without limit, and catt is the *likelier* of the two
+	// subprocesses to produce a Python traceback — pychromecast and zeroconf both
+	// log through it, and a scan that goes wrong can keep printing for the whole
+	// 30s budget. Only the first few hundred bytes are ever looked at (shortError
+	// caps the message at 400 runes) and the opening lines are the useful part.
+	//
+	// One writer for both streams, as CombinedOutput does: os/exec special-cases
+	// Stdout == Stderr onto a single pipe, so there is no concurrent write to the
+	// buffer and the interleaving is preserved.
+	buf := &limitedBuffer{max: maxSubprocessOutput}
+	cmd.Stdout, cmd.Stderr = buf, buf
+	err := cmd.Run()
+	out := buf.String()
 	// Name the timeout. A killed subprocess usually prints nothing, so cattFailure
 	// fell back to the exec error and the device card read "signal: killed" — true,
 	// but it does not tell anyone that catt simply took too long. Only the error is
@@ -466,7 +502,7 @@ func runCatt(ctx context.Context, timeout time.Duration, args ...string) (string
 	if err != nil && ctx.Err() == context.DeadlineExceeded {
 		err = fmt.Errorf("catt timed out after %s", timeout)
 	}
-	return string(out), err
+	return out, err
 }
 
 // cattFailure builds a human-readable reason from a failed catt invocation.
@@ -596,12 +632,12 @@ func getLiveStatus(ctx context.Context, dev DeviceConfig) DeviceStatus {
 // gets to explain itself instead of being killed with nothing on the pipe.
 const statusQueryTimeout = 15 * time.Second
 
-// maxSubprocessOutput bounds what we buffer from the status helper. Both of its
-// streams are read into memory, one pair per configured device per poll, and
-// nothing about the helper guarantees it stays quiet — a zeroconf or
-// pychromecast logger stuck in a retry loop can write for the whole budget
-// above. Generous enough for the JSON payload and the traceback it carries in
-// "detail", which is all we would ever want to look at.
+// maxSubprocessOutput bounds what we buffer from a subprocess — the status
+// helper here, and catt in runCatt. Their streams are read into memory, one set
+// per configured device per poll, and nothing guarantees either stays quiet: a
+// zeroconf or pychromecast logger stuck in a retry loop can write for the whole
+// budget above. Generous enough for the JSON payload and the traceback it
+// carries in "detail", which is all we would ever want to look at.
 const maxSubprocessOutput = 64 << 10
 
 // limitedBuffer collects at most max bytes and silently discards the rest,
@@ -769,7 +805,7 @@ func monitorDevices(ctx context.Context) {
 			// that were actually up.
 			st := getPychromecastStatus(ctx, dev)
 			if st.Error != "" {
-				log.Printf("skipping auto-cast to %q: %s", dev.Name, st.Error)
+				log.Printf("skipping auto-cast to %q: %s", deviceLabel(dev), st.Error)
 				continue
 			}
 			foreign = st.Foreign
@@ -786,13 +822,13 @@ func monitorDevices(ctx context.Context) {
 			continue
 		}
 		if foreign {
-			log.Printf("taking %q back from another app", dev.Name)
+			log.Printf("taking %q back from another app", deviceLabel(dev))
 		}
-		log.Printf("auto-casting to %q: %s", dev.Name, url)
+		log.Printf("auto-casting to %q: %s", deviceLabel(dev), url)
 		args := append(cattDeviceArgs(dev), "cast_site", url)
 		out, err := runCatt(ctx, 30*time.Second, args...)
 		if err != nil {
-			log.Printf("cast error for %q: %v — %s", dev.Name, err, strings.TrimSpace(out))
+			log.Printf("cast error for %q: %v — %s", deviceLabel(dev), err, strings.TrimSpace(out))
 			setCastError(dev, cattFailure(err, out))
 		} else {
 			setCastState(dev, true)
@@ -1146,6 +1182,10 @@ func handleSubnets(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(cidrs)
 }
 
+// maxEurekaInfo bounds the /setup/eureka_info body we are willing to read from
+// a host that answered on port 8008. A genuine reply is a few KB.
+const maxEurekaInfo = 64 << 10
+
 // tcpScan probes each host in subnets on port 8008.
 // Pass nil subnets to auto-detect from local interfaces.
 // onStatus receives human-readable status lines (including subnet info).
@@ -1248,7 +1288,13 @@ func tcpScan(ctx context.Context, subnets []string, onStatus func(string), onFou
 				var info struct {
 					Name string `json:"name"`
 				}
-				if err := json.NewDecoder(resp.Body).Decode(&info); err != nil || info.Name == "" {
+				// Bound the body. This decodes whatever answered on port 8008 of an
+				// address we picked ourselves, which is very often not a Chromecast,
+				// and an unbounded Decode reads until the top-level object closes —
+				// on a LAN that is tens of megabytes per host before the 2s client
+				// timeout stops it, times fifty hosts in flight. A real eureka_info
+				// reply is a few KB.
+				if err := json.NewDecoder(io.LimitReader(resp.Body, maxEurekaInfo)).Decode(&info); err != nil || info.Name == "" {
 					return
 				}
 
@@ -1430,7 +1476,7 @@ func handleCast(w http.ResponseWriter, r *http.Request) {
 		// handler returns.
 		out, err := runCatt(context.Background(), 30*time.Second, args...)
 		if err != nil {
-			log.Printf("cast %q -> %s: %v — %s", req.Name, req.URL, err, strings.TrimSpace(out))
+			log.Printf("cast %q -> %s: %v — %s", deviceLabel(dev), req.URL, err, strings.TrimSpace(out))
 			setCastError(dev, cattFailure(err, out))
 		} else {
 			setCastState(dev, true)
@@ -1465,7 +1511,7 @@ func handleStop(w http.ResponseWriter, r *http.Request) {
 		args := append(cattDeviceArgs(dev), "stop")
 		out, err := runCatt(context.Background(), 15*time.Second, args...)
 		if err != nil {
-			log.Printf("stop %q: %v — %s", req.Name, err, strings.TrimSpace(out))
+			log.Printf("stop %q: %v — %s", deviceLabel(dev), err, strings.TrimSpace(out))
 			setCastError(dev, cattFailure(err, out))
 		} else {
 			setCastState(dev, false)
