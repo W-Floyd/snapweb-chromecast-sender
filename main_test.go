@@ -449,6 +449,73 @@ func TestFailedCastDoesNotLearnSomeoneElsesApp(t *testing.T) {
 	}
 }
 
+// The learn flag is armed by a cast and consumed by the next poll that finds
+// something running, so a cast that exits 0 without the dashboard sticking left
+// it armed indefinitely — and a poll hours later, once somebody had started their
+// own app, offered that app to the learner as ours.
+//
+// It takes two devices to do real damage, because agreement is what promotes a
+// candidate: one stale flag only mis-seeds the candidate, two agree and the wrong
+// id becomes trusted fleet-wide. An applied observation of an *idle* device is
+// proof that nothing of ours is running, which is exactly the reasoning
+// setCastError already disarms on.
+func TestIdleObservationDisarmsTheAppLearner(t *testing.T) {
+	resetCastState()
+	a := DeviceConfig{Name: "Lounge", Host: "1.2.3.4"}
+	b := DeviceConfig{Name: "Kitchen", Host: "5.6.7.8"}
+
+	for _, dev := range []DeviceConfig{a, b} {
+		setCastState(dev, true) // arms the learn flag
+		// The cast reported success, but the device is sitting idle.
+		if !observeCastState(dev, false, "", time.Now()) {
+			t.Fatal("a fresh observation should be applied")
+		}
+		// Somebody starts Netflix on it later.
+		observeCastState(dev, true, "CA5E9605", time.Now())
+	}
+	if isForeignApp("84912283") {
+		t.Error("idle polls left the learner armed, and someone else's app became ours")
+	}
+	if isForeignApp("CA5E9605") {
+		t.Error("nothing may be called foreign while nothing has been learned")
+	}
+
+	// The flag must still do its job when the cast does stick.
+	resetCastState()
+	learnCastApp(t, a, "84912283")
+}
+
+func TestLimitedBufferKeepsThePrefixAndClaimsTheWholeWrite(t *testing.T) {
+	b := &limitedBuffer{max: 8}
+	// A short count would surface as io.ErrShortWrite from cmd.Run and replace the
+	// real result with a plumbing detail.
+	if n, err := b.Write([]byte("abcdefghij")); n != 10 || err != nil {
+		t.Errorf("Write = (%d, %v), want (10, nil)", n, err)
+	}
+	if got := b.String(); got != "abcdefgh" {
+		t.Errorf("buffered %q, want the first 8 bytes", got)
+	}
+	// Writes past the cap are dropped, not appended, and not an error either.
+	if n, err := b.Write([]byte("klm")); n != 3 || err != nil {
+		t.Errorf("over-cap Write = (%d, %v), want (3, nil)", n, err)
+	}
+	if got := b.String(); got != "abcdefgh" {
+		t.Errorf("buffer grew past its cap: %q", got)
+	}
+	if len(b.Bytes()) != 8 {
+		t.Errorf("Bytes() = %d bytes, want 8", len(b.Bytes()))
+	}
+}
+
+// The layered budget in cc_status.py only works if the Go side outlasts the
+// script's own watchdog; otherwise the script is killed with nothing on the pipe,
+// which is the failure mode the watchdog exists to avoid.
+func TestStatusQueryTimeoutOutlastsTheScriptWatchdog(t *testing.T) {
+	if statusQueryTimeout <= 12*time.Second {
+		t.Errorf("statusQueryTimeout = %v, must exceed the script's 12s watchdog", statusQueryTimeout)
+	}
+}
+
 func TestUnaddressedDeviceIsNotProbed(t *testing.T) {
 	// A blank "+ Add manually" row has neither identifier. Probing it shelled out
 	// for the full timeout every poll, and every such row shares one deviceKey.

@@ -209,6 +209,15 @@ func observeCastState(dev DeviceConfig, playing bool, appID string, observedAt t
 			learnedCastApp = ""
 		}
 		delete(castLearnPending, k)
+	} else if !playing {
+		// Nothing of ours ended up running, so disarm the flag for the same reason
+		// setCastError does: the next app to appear on this device belongs to
+		// somebody else. Left armed it never expired, and an *hours later* poll —
+		// after someone had started their own app — claimed that app as ours.
+		// A cast can exit 0 without the dashboard sticking, and the very next tick
+		// re-casts an idle device and re-arms this anyway, so there is nothing to
+		// lose by dropping it.
+		delete(castLearnPending, k)
 	}
 	castStates[k] = playing
 	if playing {
@@ -441,7 +450,22 @@ func cattDeviceArgs(dev DeviceConfig) []string {
 func runCatt(ctx context.Context, timeout time.Duration, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "catt", args...).CombinedOutput()
+	cmd := exec.CommandContext(ctx, "catt", args...)
+	// Bound the wait that follows the kill. CommandContext SIGKILLs catt when the
+	// timeout fires, but Wait then also blocks until the output pipes close, and a
+	// process that inherited them and outlived the kill holds this call open with
+	// no deadline of its own — wedging the monitor loop, or leaking a status
+	// request's goroutine, permanently.
+	cmd.WaitDelay = 5 * time.Second
+	out, err := cmd.CombinedOutput()
+	// Name the timeout. A killed subprocess usually prints nothing, so cattFailure
+	// fell back to the exec error and the device card read "signal: killed" — true,
+	// but it does not tell anyone that catt simply took too long. Only the error is
+	// replaced: whatever catt did manage to print still wins, being the more
+	// specific of the two.
+	if err != nil && ctx.Err() == context.DeadlineExceeded {
+		err = fmt.Errorf("catt timed out after %s", timeout)
+	}
 	return string(out), err
 }
 
@@ -567,19 +591,63 @@ func getLiveStatus(ctx context.Context, dev DeviceConfig) DeviceStatus {
 	return ds
 }
 
+// statusQueryTimeout is the outermost layer of the budget documented in
+// cc_status.py: it must stay above that script's own 12s watchdog, so the script
+// gets to explain itself instead of being killed with nothing on the pipe.
+const statusQueryTimeout = 15 * time.Second
+
+// maxSubprocessOutput bounds what we buffer from the status helper. Both of its
+// streams are read into memory, one pair per configured device per poll, and
+// nothing about the helper guarantees it stays quiet — a zeroconf or
+// pychromecast logger stuck in a retry loop can write for the whole budget
+// above. Generous enough for the JSON payload and the traceback it carries in
+// "detail", which is all we would ever want to look at.
+const maxSubprocessOutput = 64 << 10
+
+// limitedBuffer collects at most max bytes and silently discards the rest,
+// keeping the *first* ones: the helper writes its single JSON object before
+// anything else can follow it, and a traceback's opening lines are the useful
+// part of it.
+type limitedBuffer struct {
+	buf bytes.Buffer
+	max int
+}
+
+func (b *limitedBuffer) Write(p []byte) (int, error) {
+	// Always claim the whole write, even the part that was dropped. A short count
+	// makes the copier report io.ErrShortWrite as the command's error, which would
+	// replace the real result with a plumbing detail.
+	total := len(p)
+	if room := b.max - b.buf.Len(); room > 0 {
+		if len(p) > room {
+			p = p[:room]
+		}
+		b.buf.Write(p)
+	}
+	return total, nil
+}
+
+func (b *limitedBuffer) Bytes() []byte  { return b.buf.Bytes() }
+func (b *limitedBuffer) String() string { return b.buf.String() }
+
 func getPychromecastStatus(ctx context.Context, dev DeviceConfig) DeviceStatus {
 	ds := DeviceStatus{Name: dev.Name, State: "unknown"}
-	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, statusQueryTimeout)
 	defer cancel()
 	// Keep stderr out of stdout: zeroconf/pychromecast log lines and Python
 	// warnings land on stderr, and mixing them into stdout makes the JSON
 	// unparseable even when the query itself succeeded.
 	cmd := exec.CommandContext(ctx, "python3", statusScript, dev.Host)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	stdout := &limitedBuffer{max: maxSubprocessOutput}
+	stderr := &limitedBuffer{max: maxSubprocessOutput}
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	// Bound the post-kill wait, as runCatt does: without it Wait blocks until the
+	// output pipes close, which a process that inherited them and survived the
+	// kill need never do — and this call has no deadline left to save it.
+	cmd.WaitDelay = 5 * time.Second
 	// Stamp before running: what this reports is true as of now, not as of
-	// whenever the subprocess happens to finish up to 15s later.
+	// whenever the subprocess happens to finish up to statusQueryTimeout later.
 	observedAt := time.Now()
 	runErr := cmd.Run()
 
@@ -595,6 +663,16 @@ func getPychromecastStatus(ctx context.Context, dev DeviceConfig) DeviceStatus {
 		// with no explanation at all.
 		errMsg, outMsg := shortError(stderr.String()), shortError(stdout.String())
 		switch {
+		// Our own deadline is checked first, ahead of stderr. The script's 12s
+		// watchdog fires before this one, so reaching it means the script never got
+		// to speak — and stderr then holds nothing but zeroconf chatter, which was
+		// being quoted onto the device card as if it were the diagnosis.
+		case ctx.Err() == context.DeadlineExceeded:
+			ds.Error = fmt.Sprintf("status query for %s timed out after %s", dev.Host, statusQueryTimeout)
+		case ctx.Err() != nil:
+			// Cancelled, not timed out — the caller (a browser that navigated away)
+			// gave up on us. Nothing was learned about the device either way.
+			ds.Error = "status query cancelled"
 		case errMsg != "":
 			ds.Error = errMsg
 		case outMsg != "":
