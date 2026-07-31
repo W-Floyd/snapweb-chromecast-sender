@@ -408,8 +408,13 @@
           this.scanStatus = 'Starting...'
           this.scanProgress = null
 
-          const url = this.scanSubnet
-            ? `/api/devices/scan?subnet=${encodeURIComponent(this.scanSubnet)}`
+          // Trimmed before the emptiness test, the way castDevice trims its URL:
+          // a field holding nothing but spaces is truthy here, so it was sent as
+          // an explicit subnet and came back as "Invalid subnet" — for what the
+          // placeholder calls auto-detect, and what clearing the box looks like.
+          const subnet = (this.scanSubnet || '').trim()
+          const url = subnet
+            ? `/api/devices/scan?subnet=${encodeURIComponent(subnet)}`
             : '/api/devices/scan'
           const es = new EventSource(url)
 

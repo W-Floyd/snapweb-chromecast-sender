@@ -73,9 +73,10 @@ Neither is installed outside the Docker image, so `/api/devices/*` degrades to e
 rows when running `go run` on a dev machine. That's expected. **No test may shell out
 to `catt` or to the status helper** — keep it that way.
 
-The way the *rest* of the logic is still tested is five function variables —
-`probeDevice`, `castSite`, `stopCast`, `mdnsScan`, `tcpScanner` — that the tests
-substitute (`withFakeCatt`, `withProbe`, `withScanners`). They exist because
+The way the *rest* of the logic is still tested is a set of function variables —
+`probeDevice`, `castSite`, `stopCast`, `mdnsScan`, `tcpScanner`, `cattCmd`,
+`detectSubnets` — that the tests substitute (`withFakeCatt`, `withProbe`,
+`withScanners`, `withCattStandIn`, `withDetectedSubnets`). They exist because
 `monitorDevices` is the only code that both probes a device and decides whether to cast
 to it, so none of its ordering could be exercised while it shelled out directly, and the
 same went for the goroutines in `/api/devices/cast` and `/stop`, which are where a
@@ -84,15 +85,30 @@ one of them, and a new decision in the loop belongs in a test that drives it —
 probe deliberately applies the observation the real one does, because the loop reads
 `castStates`, not the returned struct.
 
-The last two are `handleScan`'s pair of stages. An mDNS hit ends the stream early, so
-that whole branch — the `found` events, the count, the TCP fallback it skips — was
-unreachable in a test that may not run `catt`; and the fallback with no explicit subnet
-probes 254 hosts of whatever `localSubnets` finds, which is the LAN of the machine
-running the tests. `tcpScan` itself is exercised for real, against loopback: the
-`chromecastSetupPort` var is a variable only so a test can put a stand-in server on that
-port and reach the confirm step — dial, fetch `/setup/eureka_info`, decode, require a
-name — which decides whether a responding host is reported at all and otherwise needs a
-Chromecast on the test machine.
+`mdnsScan` and `tcpScanner` are `handleScan`'s pair of stages. An mDNS hit ends the
+stream early, so that whole branch — the `found` events, the count, the TCP fallback it
+skips — was unreachable in a test that may not run `catt`; and the fallback with no
+explicit subnet probes 254 hosts of whatever `localSubnets` finds, which is the LAN of
+the machine running the tests. `tcpScan` itself is exercised for real, against loopback:
+the `chromecastSetupPort` var is a variable only so a test can put a stand-in server on
+that port and reach the confirm step — dial, fetch `/setup/eureka_info`, decode, require
+a name — which decides whether a responding host is reported at all and otherwise needs
+a Chromecast on the test machine. `detectSubnets` is the auto-detection inside `tcpScan`,
+for the same reason one layer down: both halves of that fallback — the give-up message a
+host with no private address gets, and a detected subnet reaching the probe at all —
+otherwise depended on what the tester's machine happened to be plugged into.
+
+`cattCmd` builds the subprocess `runCatt` runs, and the tests point it at this test
+binary re-invoked to run `TestCattStandIn` (its mode arrives in the environment, because
+catt's own `-d` would reach the child's flag parser as an unknown flag). That is not a
+way of running catt: it is the only way to assert what `runCatt` itself decides — the
+deadline it *names*, so a killed subprocess does not reach the card as "signal: killed";
+the single buffer both streams share, which is what keeps a traceback in order; the cap
+on what it buffers, which must not surface as `io.ErrShortWrite` in place of the real
+result — and, through the argv the seam records, the subcommand and timeout budget each
+of `cattStatus`, `castSite`, `stopCast` and `cattScan` is given. A typo in one of those
+subcommand names is otherwise invisible until a device fails to cast, with catt's usage
+message on the card as the only clue.
 
 `interpretStatusOutput` is the same split one layer down: `getPychromecastStatus` is now
 only the subprocess plumbing, and everything that *reads* the result — the diagnostic
@@ -103,6 +119,22 @@ body and for the same reason: a bare `null` on stdout decodes into a value witho
 error and leaves an empty `error` and `is_idle: false`, which reads as "the device is
 playing something" — a state nobody reported, written into `castStates` and rendered on
 the card.
+
+It refuses a second payload for the same reason: `is_idle: false` with no `app_id`. The
+app id is the whole means of telling our own dashboard from somebody else's, and
+`device_is_idle` in `cc_status.py` already reports a device with no app id as *idle* — so
+a payload claiming otherwise describes a state neither answer fits. Recorded as playing
+it matches the "playing, not foreign, not stale" skip on every tick and the device is
+never touched again; recorded as idle it re-casts over whatever is on screen every tick.
+This is not only a guard against the two sides drifting: the helper decides idleness on
+the **raw** app id and then strips it, so a device reporting an app id of nothing but
+whitespace arrives here as exactly that payload.
+
+The helper's `detail` — the traceback, which it caps at 4000 characters precisely so it
+survives to be read — goes to the **log**, not into the `DeviceStatus`. It is the only
+thing that identifies a broken pychromecast install, and `error` already carries the
+one-line summary that belongs on a card sized for one line. Decoded and dropped, which is
+what happened before, it was produced at that cost and read by nobody.
 
 The layered timeouts are not asserted by hand: `TestStatusQueryTimeoutOutlastsTheScriptWatchdog`
 reads `OVERALL_TIMEOUT` and friends straight out of `cc_status.py` (no interpreter
@@ -170,12 +202,19 @@ Order matters inside it. For an `auto_cast` row the two URL problems are reporte
 whereas the duplicate note only says which row does the casting — and
 `autoCastTargets` claims a `deviceKey` for the first matching row *before* it looks at
 that row's URL, so a duplicated pair whose first row has the unusable URL is never
-cast and "only the first is auto-cast" was actively misleading. A row with auto-cast
-off skips the URL gates entirely, so it keeps the duplicate advisory — but a
-*different* one (`duplicateEntryWarningNoAuto`): "only the first is auto-cast" names a
+cast and leading with the duplicate advisory was actively misleading. A row with
+auto-cast off skips the URL gates entirely, so it keeps the duplicate advisory — but a
+*different* one (`duplicateEntryWarningNoAuto`): naming the row that gets cast is a
 consequence that cannot apply to a row with the box unticked, and reads as though
 ticking it would be pointless. What is left is the cost that applies either way, which
 is that both rows show the same state and the same cast error.
+
+The advisory says "only the first **with auto-cast enabled**", not "only the first",
+because `autoCastTargets` skips a row with the box unticked *before* it claims the
+`deviceKey`: tick it on the second row of a pair and not the first, and the second row
+is the one being cast — and it is the row the advisory is rendered on. Naming the first
+row there told the reader that the row in front of them was inert when it was in fact
+the only one doing anything.
 
 The implication runs one way only — a warned device may still be cast to (one with no
 IP is cast blind; the first row of a duplicated pair is the row that gets cast) — so

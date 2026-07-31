@@ -317,6 +317,12 @@ func isCasting(dev DeviceConfig) bool {
 // otherwise end up in every status response.
 const maxStatusTextLen = 400
 
+// maxLoggedDetailLen bounds the helper's "detail" field on its way to the log.
+// Matches MAX_DETAIL in cc_status.py, which is what a well-behaved helper has
+// already clipped it to; the bound is here because the field arrives from a
+// subprocess and nothing but this reader enforces that.
+const maxLoggedDetailLen = 4000
+
 // shortText trims and bounds a subprocess-supplied string on its way into a
 // DeviceStatus. Everything we report there is repeated in every
 // /api/devices/status response for as long as it stands, so an unbounded one — a
@@ -325,11 +331,16 @@ const maxStatusTextLen = 400
 // the state as much as to errors: State carries the receiver app's own
 // display_name, and nothing in the cast protocol bounds that.
 func shortText(msg string) string {
+	return boundText(msg, maxStatusTextLen)
+}
+
+// boundText trims msg and caps it at limit runes, marking it where it was cut.
+func boundText(msg string, limit int) string {
 	msg = strings.TrimSpace(msg)
 	// Slice by runes, not bytes: a byte-slice can cut a multi-byte character in
 	// half and produce invalid UTF-8 in the JSON response.
-	if r := []rune(msg); len(r) > maxStatusTextLen {
-		msg = string(r[:maxStatusTextLen]) + "…"
+	if r := []rune(msg); len(r) > limit {
+		msg = string(r[:limit]) + "…"
 	}
 	return msg
 }
@@ -527,13 +538,28 @@ func cattDeviceArgs(dev DeviceConfig) []string {
 	return []string{"-d", dev.Name}
 }
 
+// cattCmd builds the process runCatt runs. A variable for the same reason
+// chromecastSetupPort is one: everything runCatt itself decides — that a killed
+// subprocess is reported as a named timeout rather than as "signal: killed", that
+// both streams reach the caller through one bounded buffer — and the argv and
+// timeout budget each of the three catt calls below is given were otherwise only
+// reachable by running catt, which no test here may do. A stand-in process is
+// enough to exercise all of it, and a typo in a subcommand name is invisible
+// until a device fails to cast.
+//
+// It takes the context so the substitute keeps the kill-on-deadline behaviour
+// that the timeout naming is about.
+var cattCmd = func(ctx context.Context, args ...string) *exec.Cmd {
+	return exec.CommandContext(ctx, "catt", args...)
+}
+
 // runCatt runs catt with a timeout. The parent ctx lets a caller abandon the
 // subprocess early — an HTTP handler whose client has disconnected, say —
 // instead of leaving it to run out its full timeout.
 func runCatt(ctx context.Context, timeout time.Duration, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "catt", args...)
+	cmd := cattCmd(ctx, args...)
 	// Bound the wait that follows the kill. CommandContext SIGKILLs catt when the
 	// timeout fires, but Wait then also blocks until the output pipes close, and a
 	// process that inherited them and outlived the kill holds this call open with
@@ -620,13 +646,20 @@ func duplicateDeviceKeys(devices []DeviceConfig) map[string]bool {
 //
 // Which one a row gets turns on whether auto-cast is on, because the second
 // clause is the actionable half and it is only true when something is casting:
-// telling a row with auto-cast *off* that "only the first is auto-cast" states a
+// telling a row with auto-cast *off* that only one of them is cast states a
 // consequence that cannot apply to it, and reads as though enabling the checkbox
 // were pointless. What is left in that case is the cost that applies either way —
 // both rows show the same state and the same cast error, so a failure on one is
 // rendered on both.
+//
+// "the first with auto-cast enabled", not "the first": autoCastTargets skips a
+// row with the box unticked *before* it claims the deviceKey, so with the box
+// ticked on the second row of a pair only and not the first, the second row is
+// the one being cast — and it is the row this advisory is rendered on. Naming the
+// first row there told the reader that the row in front of them was inert when it
+// was in fact the only one doing anything.
 const (
-	duplicateEntryWarning       = "Another entry points at the same device — they share one cast state, and only the first is auto-cast."
+	duplicateEntryWarning       = "Another entry points at the same device — they share one cast state, and only the first with auto-cast enabled is cast."
 	duplicateEntryWarningNoAuto = "Another entry points at the same device — they share one cast state, so both rows show the same status."
 )
 
@@ -657,8 +690,8 @@ func configWarning(dev DeviceConfig, url string, duplicate bool) string {
 	// duplicate note only says which row does the casting. autoCastTargets claims
 	// the deviceKey for the first matching row before it looks at that row's URL,
 	// so a duplicated pair whose first row has the unusable URL is never cast —
-	// and leading with "only the first is auto-cast" told the user the first row
-	// was working while hiding the one problem they could actually fix.
+	// and leading with the duplicate advisory told the user the first row was
+	// working while hiding the one problem they could actually fix.
 	if url == "" {
 		return "No URL for this device and no default URL — auto-cast has nothing to cast."
 	}
@@ -834,6 +867,14 @@ type statusPayload struct {
 	DisplayName string `json:"display_name"`
 	IsIdle      bool   `json:"is_idle"`
 	Error       string `json:"error"`
+	// Detail is the helper's traceback, sent alongside Error whenever the failure
+	// was an unexpected exception rather than a diagnosis the helper recognised.
+	// It goes to the log rather than into the DeviceStatus: it is the only thing
+	// that identifies a broken pychromecast install, and the helper caps it at
+	// 4000 characters precisely so it survives to be read — but it is far too long
+	// for a device card, and Error already carries the one-line summary of it.
+	// Decoded and discarded, it was produced at that cost and never read at all.
+	Detail string `json:"detail"`
 }
 
 func getPychromecastStatus(ctx context.Context, dev DeviceConfig) DeviceStatus {
@@ -906,6 +947,27 @@ func interpretStatusOutput(dev DeviceConfig, stdout, stderr []byte, runErr, ctxE
 	}
 	if result.Error != "" {
 		ds.Error = shortText(result.Error)
+		// The traceback, if there is one, goes to the log — see statusPayload.Detail.
+		if detail := boundText(result.Detail, maxLoggedDetailLen); detail != "" {
+			log.Printf("status helper failed for %q: %s\n%s", deviceLabel(dev), ds.Error, detail)
+		}
+		return ds
+	}
+
+	// A device reported as playing has to name the app that is playing. The app id
+	// is the whole means of telling our own dashboard from somebody else's, and the
+	// helper's own idle rule already reports a device with no app id as idle (see
+	// device_is_idle in cc_status.py) — so a payload claiming otherwise describes a
+	// state we cannot act on, and both ways of acting on it are wrong: recorded as
+	// playing it makes the monitor skip the device for the life of the process,
+	// recorded as idle it re-casts over whatever is on screen on every tick.
+	// Refuse it and say so, exactly as a null payload is refused above.
+	//
+	// Not merely defensive against drift, though it is that too: the helper decides
+	// idleness on the *raw* app id and then strips it, so a device reporting an app
+	// id of nothing but whitespace arrives here as "playing" with the field empty.
+	if !result.IsIdle && result.AppID == "" {
+		ds.Error = "status helper reported a playing device with no app id"
 		return ds
 	}
 
@@ -1553,6 +1615,14 @@ const maxEurekaInfo = 64 << 10
 // without a real Chromecast on the machine running the tests.
 var chromecastSetupPort = 8008
 
+// detectSubnets is the auto-detection tcpScan falls back on when the caller named
+// no subnet. A variable for the same reason tcpScanner is one: the real
+// implementation returns whatever LAN the machine is on, so a test driving this
+// path through it would probe 254 of the tester's neighbours — leaving the give-up
+// message, which is the only thing a host with no private address ever sees, and
+// the handover of a detected subnet to the probe, both asserted nowhere.
+var detectSubnets = localSubnets
+
 // tcpScan probes each host in subnets on the Chromecast setup port.
 // Pass nil subnets to auto-detect from local interfaces.
 // onStatus receives human-readable status lines (including subnet info).
@@ -1566,7 +1636,7 @@ var chromecastSetupPort = 8008
 // never seen — the same trap handleScan's other messages document.
 func tcpScan(ctx context.Context, subnets []string, onStatus func(string), onFound func(DiscoveredDevice), onProgress func(int, int)) ([]DiscoveredDevice, string) {
 	if len(subnets) == 0 {
-		subnets = localSubnets()
+		subnets = detectSubnets()
 	}
 	if len(subnets) == 0 {
 		// Name the private-address requirement: auto-detect declining to guess is

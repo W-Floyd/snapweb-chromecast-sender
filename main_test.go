@@ -1,14 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -939,19 +943,43 @@ func TestPruneCastStatesDropsActions(t *testing.T) {
 	dev := DeviceConfig{Name: "Gone", Host: "1.2.3.4"}
 	setCastState(dev, true, "http://dash/")
 	observeCastState(dev, true, "84912283", time.Now())
+	// Every map keyed by deviceKey has to be covered, so a device that comes *back*
+	// under the same key does not inherit the state of the one that left — a
+	// resurrected castErrors entry is the visible one: a red error on the card of a
+	// device nothing has failed on yet. Written directly because no single sequence
+	// of calls leaves all six populated at once (a recorded error means nothing of
+	// ours is on screen, and an applied observation consumes the learn flag), and
+	// the point here is the set of maps, not how they came to be filled.
+	castStatesMu.Lock()
+	castErrors[deviceKey(dev)] = "Failed to connect."
+	castLearnPending[deviceKey(dev)] = true
+	castStatesMu.Unlock()
+
 	pruneCastStates(nil)
+
 	castStatesMu.RLock()
-	nActions, nObserved := len(castActions), len(castObserved)
-	nURLs := len(castURLs)
+	sizes := map[string]int{
+		"castStates":       len(castStates),
+		"castErrors":       len(castErrors),
+		"castActions":      len(castActions),
+		"castObserved":     len(castObserved),
+		"castURLs":         len(castURLs),
+		"castLearnPending": len(castLearnPending),
+	}
 	castStatesMu.RUnlock()
-	if nURLs != 0 {
-		t.Errorf("castURLs has %d stale entries after prune", nURLs)
+	for name, n := range sizes {
+		if n != 0 {
+			t.Errorf("%s has %d stale entries after prune", name, n)
+		}
 	}
-	if nActions != 0 {
-		t.Errorf("castActions has %d stale entries after prune", nActions)
-	}
-	if nObserved != 0 {
-		t.Errorf("castObserved has %d stale entries after prune", nObserved)
+
+	// And a device still in the config keeps everything.
+	resetCastState()
+	kept := DeviceConfig{Name: "Kept", Host: "5.6.7.8"}
+	setCastError(kept, "Failed to connect.")
+	pruneCastStates([]DeviceConfig{kept})
+	if castError(kept) == "" {
+		t.Error("a device that is still configured lost its recorded cast error")
 	}
 }
 
@@ -1025,12 +1053,12 @@ func TestCheckIntervalTracksConfig(t *testing.T) {
 // the status line when the stream ends, so a reason sent as a status was
 // replaced by the generic "No devices found".
 func TestTCPScanReportsWhyItCannotRun(t *testing.T) {
-	// Only exercise the give-up path. With a private subnet detected, tcpScan
-	// would go and probe all 254 hosts of the machine's real LAN, which a unit
-	// test has no business doing.
-	if len(localSubnets()) > 0 {
-		t.Skip("host has a private subnet; reaching this path would scan the real LAN")
-	}
+	// Auto-detection is substituted rather than skipped around: driving this path
+	// through the real one probes all 254 hosts of whatever LAN the machine running
+	// the tests is on, so the message a host with no private address gets — the only
+	// thing it ever sees from a scan — went unasserted on every machine that has one.
+	withDetectedSubnets(t, nil)
+
 	var statuses []string
 	devices, failure := tcpScan(context.Background(), nil,
 		func(msg string) { statuses = append(statuses, msg) },
@@ -1046,6 +1074,30 @@ func TestTCPScanReportsWhyItCannotRun(t *testing.T) {
 	if len(statuses) != 0 {
 		t.Errorf("the reason must ride on done, not on a status event: %q", statuses)
 	}
+
+	// And the other half of the same fallback: a detected subnet has to actually
+	// reach the probe, or auto-detect quietly scans nothing and reports "no devices
+	// found" for a LAN full of them. Loopback, so no packet leaves the machine.
+	withDetectedSubnets(t, []string{loopbackSubnet})
+	_, failure = tcpScan(context.Background(), nil,
+		func(msg string) { statuses = append(statuses, msg) },
+		func(DiscoveredDevice) {},
+		func(int, int) {},
+	)
+	if failure != "" {
+		t.Errorf("failure = %q, want none once a subnet was detected", failure)
+	}
+	if len(statuses) != 1 || !strings.Contains(statuses[0], loopbackSubnet+".0/24") {
+		t.Errorf("statuses = %q, want one naming the detected subnet", statuses)
+	}
+}
+
+// withDetectedSubnets substitutes subnet auto-detection for the test's duration.
+func withDetectedSubnets(t *testing.T, subnets []string) {
+	t.Helper()
+	saved := detectSubnets
+	detectSubnets = func() []string { return subnets }
+	t.Cleanup(func() { detectSubnets = saved })
 }
 
 // A saved URL change has to reach a device that is already showing the old
@@ -1704,6 +1756,35 @@ func TestCastAndStopHandlersRecordSuccess(t *testing.T) {
 	}
 }
 
+// A stop fails the same way a cast does — the response has already gone out, so
+// the only place the reason can land is castErrors, to be merged into the next
+// status. Nothing else reports it: the card would otherwise read a clean "Idle"
+// for a device still showing whatever it was showing.
+func TestStopHandlerRecordsAFailure(t *testing.T) {
+	resetCastState()
+	f := withFakeCatt(t)
+	f.err, f.out = errors.New("exit status 1"), "Failed to connect.\n"
+	dev := DeviceConfig{Name: "Lounge", Host: "1.2.3.4"}
+	setCastState(dev, true, "http://dash/")
+
+	rec := httptest.NewRecorder()
+	handleStop(rec, httptest.NewRequest(http.MethodPost, "/api/devices/stop",
+		strings.NewReader(`{"name":" Lounge ","host":" 1.2.3.4 "}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("stop = %d (%s)", rec.Code, rec.Body)
+	}
+	waitFor(t, "the stop failure to be recorded", func() bool { return castError(dev) != "" })
+	if got := castError(dev); got != "Failed to connect." {
+		t.Errorf("castError = %q, want catt's explanation filed under the trimmed key", got)
+	}
+	// Nothing of ours is known to be on screen after a stop we could not confirm,
+	// so the recorded URL goes with it: keeping it would let the monitor conclude
+	// the current page is the one it asked for.
+	if _, ok := lastCastURL(dev); ok {
+		t.Error("a failed stop left a recorded URL behind")
+	}
+}
+
 // waitFor polls until cond holds. /api/devices/cast and /stop answer *before*
 // catt has run, so their outcome is recorded after the response — and recording
 // it is the last thing those goroutines do, which makes waiting for the outcome
@@ -1767,7 +1848,7 @@ func TestConfigWarningFlagsDuplicateEntries(t *testing.T) {
 	// report the same state and the same cast error, so a failure on one is
 	// rendered on both.
 	//
-	// But it is a *different* advisory. "Only the first is auto-cast" names a
+	// But it is a *different* advisory. Naming which row is cast states a
 	// consequence that cannot apply to a row with auto-cast off, and reads as
 	// though ticking the box would be pointless; what is left is the shared status.
 	manual := DeviceConfig{Name: "Lounge", Host: "1.2.3.4"}
@@ -1783,8 +1864,28 @@ func TestConfigWarningFlagsDuplicateEntries(t *testing.T) {
 	}
 	// The auto-cast row keeps the clause that is actionable for it: which of the
 	// two rows the monitor is actually casting from.
-	if got := configWarning(dev, "http://dash/", true); !strings.Contains(got, "only the first is auto-cast") {
+	if got := configWarning(dev, "http://dash/", true); !strings.Contains(got, "only the first with auto-cast enabled is cast") {
 		t.Errorf("warning = %q, want it to say which row is acted on", got)
+	}
+	// And it has to name that row the way autoCastTargets picks it. A row with the
+	// box unticked is skipped *before* the deviceKey is claimed, so ticking it on
+	// the second row of a pair only makes the second row the one being cast — which
+	// is the row this advisory is rendered on. Saying "the first" there told the
+	// reader the row in front of them was inert when it was the only one working.
+	pair := []DeviceConfig{
+		{Name: "Manual", Host: "1.2.3.4"},
+		{Name: "Managed", Host: "1.2.3.4", URL: "http://dash/", AutoCast: true},
+	}
+	targets := autoCastTargets(pair, "")
+	if len(targets) != 1 || targets[0].Name != "Managed" {
+		t.Fatalf("targets = %+v, want the second row, which is the first with auto-cast on", targets)
+	}
+	got = configWarning(pair[1], pair[1].URL, true)
+	if strings.Contains(got, "only the first is") {
+		t.Errorf("warning = %q, but this *is* the row being cast — it is only the second in the list", got)
+	}
+	if !strings.Contains(got, "only the first with auto-cast enabled is cast") {
+		t.Errorf("warning = %q, want the advisory to name the row autoCastTargets actually picks", got)
 	}
 	// Still nothing to pile on for a row with no identifier at all: two blank
 	// rows share the key "name:", and getLiveStatus already explains each.
@@ -2476,6 +2577,88 @@ func TestInterpretStatusOutputRefusesANonObjectPayload(t *testing.T) {
 			t.Errorf("stdout %q was read as the device playing something", stdout)
 		}
 	}
+}
+
+// A payload that says "playing" without naming the app describes a state that
+// cannot be acted on either way: recorded as playing, the monitor skips the
+// device for the life of the process; recorded as idle, it re-casts over whatever
+// is on screen on every tick. The helper's own idle rule reports a device with no
+// app id as idle — but it decides that on the *raw* id and then strips it, so a
+// device whose app id is nothing but whitespace arrives here as exactly this.
+func TestInterpretStatusOutputRefusesAPlayingDeviceWithNoAppID(t *testing.T) {
+	dev := DeviceConfig{Name: "Lounge", Host: "1.2.3.4"}
+	for _, stdout := range []string{
+		`{"is_idle":false}`,
+		`{"app_id":"","display_name":"Something","is_idle":false}`,
+	} {
+		resetCastState()
+		ds := interpret(dev, stdout)
+		if ds.Error == "" {
+			t.Errorf("stdout %q produced no error", stdout)
+		}
+		if ds.State != "unknown" {
+			t.Errorf("stdout %q = state %q, want \"unknown\" rather than an invented one", stdout, ds.State)
+		}
+		if isCasting(dev) {
+			t.Errorf("stdout %q was recorded as the device playing something", stdout)
+		}
+	}
+	// The complement: an *idle* payload names no app and is perfectly ordinary.
+	resetCastState()
+	if ds := interpret(dev, `{"is_idle":true}`); ds.Error != "" || ds.State != "Idle" {
+		t.Errorf("idle payload = %+v, want a clean \"Idle\"", ds)
+	}
+}
+
+// The helper pays to produce a traceback — it is the only thing that identifies a
+// broken pychromecast install, and it is capped at 4000 characters precisely so it
+// survives to be read. Decoded and dropped on the floor, that cost bought nothing:
+// the card shows the one-line summary and the reason it happened went nowhere.
+func TestInterpretStatusOutputLogsTheHelpersTraceback(t *testing.T) {
+	dev := DeviceConfig{Name: "Lounge", Host: "1.2.3.4"}
+	logged := captureLog(t)
+
+	resetCastState()
+	ds := interpret(dev, `{"error":"OSError","detail":"Traceback (most recent call last):\n  ImportError"}`)
+	if ds.Error != "OSError" {
+		t.Errorf("error = %q, want the helper's summary", ds.Error)
+	}
+	// The traceback is far too long for a card sized for one line, and Error is
+	// repeated in every status response for as long as it stands.
+	if strings.Contains(ds.Error, "Traceback") {
+		t.Errorf("error = %q, want the traceback kept out of the status", ds.Error)
+	}
+	out := logged.String()
+	for _, want := range []string{"Lounge", "OSError", "ImportError"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("log = %q, want it to mention %q", out, want)
+		}
+	}
+
+	// Bounded on the way to the log as well: it arrives from a subprocess, and
+	// nothing but this reader enforces the helper's own cap on it.
+	logged.Reset()
+	interpret(dev, `{"error":"boom","detail":"`+strings.Repeat("x", maxLoggedDetailLen*2)+`"}`)
+	if n := logged.Len(); n > maxLoggedDetailLen+500 {
+		t.Errorf("logged %d bytes for one failure, want the detail bounded", n)
+	}
+
+	// And nothing at all when there is no traceback, which is every failure the
+	// helper recognised for itself.
+	logged.Reset()
+	interpret(dev, `{"error":"1.2.3.4 is not reachable on port 8009"}`)
+	if logged.Len() != 0 {
+		t.Errorf("log = %q, want silence for a diagnosis the helper made itself", logged)
+	}
+}
+
+// captureLog redirects the standard logger into a buffer for the test's duration.
+func captureLog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	buf := &bytes.Buffer{}
+	log.SetOutput(buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	return buf
 }
 
 func TestInterpretStatusOutputReportsAndRecordsWhatItSaw(t *testing.T) {
@@ -3295,5 +3478,360 @@ func TestWarningAndErrorAreSeparateFields(t *testing.T) {
 	data, _ = json.Marshal(DeviceStatus{Name: "A", State: "Idle"})
 	if strings.Contains(string(data), "error") || strings.Contains(string(data), "warning") {
 		t.Errorf("empty advisories were emitted: %s", data)
+	}
+}
+
+// --- runCatt, and the argv each catt call is built with ----------------------
+//
+// The subprocess itself is this test binary, re-invoked to run TestCattStandIn
+// and nothing else. That is what makes runCatt's own decisions assertable without
+// running catt, which no test here may do: the deadline it names rather than
+// letting the caller read "signal: killed", the two streams it merges into one
+// bounded buffer, and — through the cattCmd seam recording what it was asked for —
+// the subcommand and timeout budget each of the three catt calls is given. A typo
+// in one of those subcommand names is otherwise invisible until a device fails to
+// cast, with catt's usage message on the card as the only clue.
+
+// cattStandInEnv selects what the re-invoked binary should do. Passed in the
+// environment, not on the command line: catt's own arguments would reach the
+// child's flag parser as unknown flags ("-d") and kill it before it ran.
+const cattStandInEnv = "CATT_STAND_IN_MODE"
+
+func TestCattStandIn(t *testing.T) {
+	mode := os.Getenv(cattStandInEnv)
+	if mode == "" {
+		t.Skip("only meaningful as the stand-in subprocess")
+	}
+	switch mode {
+	case "quiet": // exits 0 with nothing on either stream, like a successful cast
+	case "streams":
+		// Written in this order, and to both streams, because os/exec hands a
+		// single pipe to both when Stdout == Stderr — which is what preserves the
+		// interleaving a traceback needs to stay readable.
+		fmt.Fprint(os.Stdout, "one ")
+		fmt.Fprint(os.Stderr, "two ")
+		fmt.Fprint(os.Stdout, "three")
+	case "flood":
+		chunk := strings.Repeat("x", 4096)
+		for written := 0; written < maxSubprocessOutput*3; written += len(chunk) {
+			fmt.Fprint(os.Stdout, chunk)
+		}
+	case "scan":
+		fmt.Fprintln(os.Stdout, "Scanning Chromecasts...")
+		fmt.Fprintln(os.Stdout, "192.168.1.5 - Kitchen - Nest Hub - Google Inc. Nest Hub")
+	case "scan-then-fail":
+		fmt.Fprintln(os.Stdout, "192.168.1.5 - Kitchen - Nest Hub - Google Inc. Nest Hub")
+		fmt.Fprint(os.Stderr, "Failed to connect.")
+		os.Exit(1)
+	case "fail":
+		fmt.Fprint(os.Stderr, "Failed to connect.")
+		os.Exit(1)
+	case "hang":
+		time.Sleep(time.Minute) // killed by runCatt's deadline
+	default:
+		fmt.Fprintf(os.Stderr, "unknown stand-in mode %q", mode)
+		os.Exit(2)
+	}
+	// os.Exit rather than returning: the testing framework would otherwise write
+	// its own "PASS" onto the pipe the caller is about to parse.
+	os.Exit(0)
+}
+
+type cattStandIn struct {
+	mu    sync.Mutex
+	calls [][]string
+	// budgets is how long each call had left when the process was built, which is
+	// the per-command timeout runCatt was given.
+	budgets []time.Duration
+}
+
+func (s *cattStandIn) recorded() ([][]string, []time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([][]string{}, s.calls...), append([]time.Duration{}, s.budgets...)
+}
+
+// withCattStandIn points the catt subprocess at this test binary for the duration
+// of the test, and records what each invocation was asked to run.
+func withCattStandIn(t *testing.T, mode string) *cattStandIn {
+	t.Helper()
+	s := &cattStandIn{}
+	saved := cattCmd
+	cattCmd = func(ctx context.Context, args ...string) *exec.Cmd {
+		s.mu.Lock()
+		s.calls = append(s.calls, append([]string{}, args...))
+		budget := time.Duration(0)
+		if deadline, ok := ctx.Deadline(); ok {
+			budget = time.Until(deadline)
+		}
+		s.budgets = append(s.budgets, budget)
+		s.mu.Unlock()
+		// Built from ctx, so the substitute keeps the kill-on-deadline behaviour the
+		// timeout naming is about.
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestCattStandIn$")
+		cmd.Env = append(os.Environ(), cattStandInEnv+"="+mode)
+		return cmd
+	}
+	t.Cleanup(func() { cattCmd = saved })
+	return s
+}
+
+func TestCattCallsPassTheRightSubcommandAndBudget(t *testing.T) {
+	dev := DeviceConfig{Name: "Lounge", Host: "1.2.3.4"}
+	cases := []struct {
+		name   string
+		run    func(context.Context)
+		args   []string
+		budget time.Duration
+	}{
+		{"status", func(ctx context.Context) { cattStatus(ctx, dev) },
+			[]string{"-d", "1.2.3.4", "status"}, 10 * time.Second},
+		{"cast_site", func(ctx context.Context) { castSite(ctx, dev, "http://dash/") },
+			[]string{"-d", "1.2.3.4", "cast_site", "http://dash/"}, 30 * time.Second},
+		{"stop", func(ctx context.Context) { stopCast(ctx, dev) },
+			[]string{"-d", "1.2.3.4", "stop"}, 15 * time.Second},
+		// The mDNS scan takes no device: it is asking who is out there.
+		{"scan", func(ctx context.Context) { cattScan(ctx) },
+			[]string{"scan"}, 30 * time.Second},
+	}
+	for _, c := range cases {
+		s := withCattStandIn(t, "quiet")
+		c.run(context.Background())
+		calls, budgets := s.recorded()
+		if len(calls) != 1 {
+			t.Fatalf("%s: ran catt %d times, want once", c.name, len(calls))
+		}
+		if got := calls[0]; !slicesEqual(got, c.args) {
+			t.Errorf("%s: argv = %v, want %v", c.name, got, c.args)
+		}
+		// Generous: the assertion is which budget was chosen, not how fast the
+		// machine got from the deadline to here.
+		if d := budgets[0]; d > c.budget || d < c.budget-2*time.Second {
+			t.Errorf("%s: budget = %s, want ~%s", c.name, d, c.budget)
+		}
+	}
+}
+
+// A subprocess killed by our own deadline prints nothing, so cattFailure falls
+// back to the exec error — and the device card then read "signal: killed", which
+// is true and tells nobody that catt simply took too long.
+func TestRunCattNamesItsOwnTimeout(t *testing.T) {
+	withCattStandIn(t, "hang")
+	start := time.Now()
+	out, err := runCatt(context.Background(), 200*time.Millisecond, "-d", "1.2.3.4", "status")
+	if err == nil {
+		t.Fatal("a subprocess that never returns produced no error")
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Errorf("runCatt took %s to give up on a hung subprocess", elapsed)
+	}
+	msg := cattFailure(err, out)
+	if !strings.Contains(msg, "timed out after 200ms") {
+		t.Errorf("failure = %q, want the timeout named", msg)
+	}
+	if strings.Contains(msg, "killed") {
+		t.Errorf("failure = %q, want the plumbing detail replaced by the reason", msg)
+	}
+}
+
+// catt's own words win over anything we could say: it exits non-zero with the
+// explanation on stderr, and stderr shares the buffer for exactly that reason.
+func TestRunCattReportsWhatCattPrinted(t *testing.T) {
+	withCattStandIn(t, "fail")
+	out, err := runCatt(context.Background(), 10*time.Second, "-d", "1.2.3.4", "stop")
+	if err == nil {
+		t.Fatal("a non-zero exit produced no error")
+	}
+	if got := cattFailure(err, out); got != "Failed to connect." {
+		t.Errorf("failure = %q, want catt's own explanation", got)
+	}
+}
+
+func TestRunCattMergesBothStreamsInOrder(t *testing.T) {
+	withCattStandIn(t, "streams")
+	out, err := runCatt(context.Background(), 10*time.Second, "status")
+	if err != nil {
+		t.Fatalf("runCatt = %v, out %q", err, out)
+	}
+	// One pipe for both streams, so the interleaving survives — a traceback split
+	// across the two and reordered is not readable, and stderr is where the useful
+	// half of a catt failure is written.
+	if out != "one two three" {
+		t.Errorf("output = %q, want both streams in the order they were written", out)
+	}
+}
+
+// Nothing bounds what catt prints: pychromecast and zeroconf both log through it,
+// and a scan that goes wrong can keep printing for the whole 30s budget.
+func TestRunCattBoundsWhatItBuffers(t *testing.T) {
+	withCattStandIn(t, "flood")
+	out, err := runCatt(context.Background(), 30*time.Second, "scan")
+	// The dropped bytes must not surface as the command's error: a short count from
+	// the buffer makes the copier report io.ErrShortWrite, which would replace the
+	// real result with a plumbing detail.
+	if err != nil {
+		t.Errorf("a chatty subprocess failed the call: %v", err)
+	}
+	if len(out) != maxSubprocessOutput {
+		t.Errorf("buffered %d bytes, want the cap of %d", len(out), maxSubprocessOutput)
+	}
+}
+
+// The mDNS path end to end, minus catt itself: a wrong guess at the output format
+// silently returns zero devices and falls through to the slow TCP scan, which is
+// indistinguishable from there being nothing on the network.
+func TestCattScanParsesWhatCattPrints(t *testing.T) {
+	withCattStandIn(t, "scan")
+	got := cattScan(context.Background())
+	want := []DiscoveredDevice{{Name: "Kitchen - Nest Hub", Host: "192.168.1.5"}}
+	if len(got) != 1 || got[0] != want[0] {
+		t.Errorf("cattScan = %+v, want %+v", got, want)
+	}
+}
+
+// A failing scan is logged and its output still parsed. catt can name devices and
+// *then* exit non-zero — a second interface it could not query, an mDNS socket it
+// could not close — and returning nothing there would send handleScan down the
+// 254-host TCP fallback for devices it had already been told about.
+func TestCattScanKeepsWhatAFailedScanPrinted(t *testing.T) {
+	withCattStandIn(t, "scan-then-fail")
+	logged := captureLog(t)
+	got := cattScan(context.Background())
+	if len(got) != 1 || got[0].Host != "192.168.1.5" {
+		t.Errorf("cattScan = %+v, want the device catt named before it failed", got)
+	}
+	// The exit status is not silently swallowed either: it is the only record that
+	// the list may be short.
+	if !strings.Contains(logged.String(), "Failed to connect.") {
+		t.Errorf("log = %q, want the scan failure recorded", logged)
+	}
+}
+
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// A ResponseWriter that cannot flush would leave every event sitting in the
+// buffer until the scan finished, which is the whole point of the stream —
+// progress that arrives at the end is not progress. Say so instead of streaming
+// into a void.
+func TestHandleScanRequiresAFlushableWriter(t *testing.T) {
+	withScanners(t,
+		func(context.Context) []DiscoveredDevice {
+			t.Error("an unflushable writer must be refused before any scanning")
+			return nil
+		},
+		func(context.Context, []string, func(string), func(DiscoveredDevice), func(int, int)) ([]DiscoveredDevice, string) {
+			t.Error("an unflushable writer must be refused before any scanning")
+			return nil, ""
+		})
+
+	rec := httptest.NewRecorder()
+	handleScan(unflushable{rec}, httptest.NewRequest(http.MethodGet, "/api/devices/scan", nil))
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("unflushable writer = %d, want 500", rec.Code)
+	}
+	if scanInFlight.Load() {
+		t.Error("a refused scan left scanInFlight set")
+	}
+}
+
+// unflushable hides httptest.ResponseRecorder's Flush method.
+type unflushable struct{ inner http.ResponseWriter }
+
+func (u unflushable) Header() http.Header         { return u.inner.Header() }
+func (u unflushable) Write(p []byte) (int, error) { return u.inner.Write(p) }
+func (u unflushable) WriteHeader(code int)        { u.inner.WriteHeader(code) }
+
+// Once the browser has gone the ResponseWriter is no longer valid to write to, and
+// a TCP scan keeps producing events for as long as it takes to finish — including
+// the found and progress callbacks, which run on the scan's own goroutines.
+func TestHandleScanWritesNothingOnceTheClientIsGone(t *testing.T) {
+	withScanners(t,
+		func(context.Context) []DiscoveredDevice { return nil },
+		func(_ context.Context, _ []string, onStatus func(string), onFound func(DiscoveredDevice), onProgress func(int, int)) ([]DiscoveredDevice, string) {
+			onStatus("probing")
+			onFound(DiscoveredDevice{Name: "Kitchen", Host: "192.168.7.5"})
+			onProgress(254, 254)
+			return []DiscoveredDevice{{Name: "Kitchen", Host: "192.168.7.5"}}, ""
+		})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest(http.MethodGet, "/api/devices/scan?subnet=192.168.7.0/24", nil).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	handleScan(rec, req)
+	if body := rec.Body.String(); body != "" {
+		t.Errorf("wrote %q to a client that had gone", body)
+	}
+	if scanInFlight.Load() {
+		t.Error("an abandoned scan left scanInFlight set")
+	}
+}
+
+// The virtual-interface filter is a guess about a name, so an unusual host — one
+// where every private address is on an interface the list happens to match, which
+// is any container on a Docker bridge — must fall back to the unfiltered set
+// rather than auto-detect nothing at all. Asserted as the relationship between the
+// two passes, because which of them is empty depends on the machine running this.
+func TestLocalSubnetsFallsBackToTheUnfilteredSet(t *testing.T) {
+	physical, all := collectSubnets(true), collectSubnets(false)
+	want := physical
+	if len(physical) == 0 {
+		want = all
+	}
+	got := localSubnets()
+	if !slicesEqual(got, want) {
+		t.Errorf("localSubnets = %v, want %v (physical %v, unfiltered %v)", got, want, physical, all)
+	}
+	// The fallback relaxes the interface-name guess and nothing else: the
+	// private-address requirement is a fact about the address, and undoing it is
+	// what would port-scan 254 strangers on a host with a routable IPv4.
+	for _, base := range got {
+		if ip := net.ParseIP(base + ".1"); ip == nil || !ip.IsPrivate() {
+			t.Errorf("auto-detected subnet %q is not private", base)
+		}
+	}
+}
+
+// Port 8008 on a LAN is not only ever a Chromecast, and a host can answer the
+// dial and then say nothing that resembles HTTP. The confirm step has to drop it
+// rather than report a device, and it must not take the scan down with it.
+func TestTCPScanIgnoresAHostThatAnswersWithoutSpeakingHTTP(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			conn.Close() // accepted, then hung up mid-request
+		}
+	}()
+
+	saved := chromecastSetupPort
+	chromecastSetupPort = ln.Addr().(*net.TCPAddr).Port
+	defer func() { chromecastSetupPort = saved }()
+
+	devices, failure := tcpScan(context.Background(), []string{loopbackSubnet},
+		func(string) {}, func(d DiscoveredDevice) { t.Errorf("reported %+v, which never served eureka_info", d) },
+		func(int, int) {})
+	if failure != "" {
+		t.Errorf("failure = %q, want none", failure)
+	}
+	if len(devices) != 0 {
+		t.Errorf("devices = %+v, want none", devices)
 	}
 }
