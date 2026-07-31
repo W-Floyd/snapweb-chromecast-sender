@@ -127,12 +127,21 @@ def main():
             emit({"error": "no status received from %s" % host})
             sys.exit(1)
 
-        app_id = s.app_id
-        # Bounded like the error strings below: this is whatever the receiver app
-        # calls itself, it is rendered straight onto the device card, and nothing
-        # in the protocol says how long it may be.
+        # Both device-supplied strings are bounded, for the same reason the error
+        # strings below are: the reader keeps only the first 64KB of stdout and a
+        # *truncated* JSON object does not parse at all, so one unbounded field
+        # takes the whole payload down and leaves the caller with no status and no
+        # diagnosis. display_name is whatever the receiver app calls itself and is
+        # rendered straight onto the device card; app_id is compared against — and
+        # when it is the first thing seen after a cast of ours, *stored* as — the
+        # id our own casts run under. Nothing in the cast protocol bounds either.
+        #
+        # is_idle is decided on the raw app_id, before the clip: a value long
+        # enough to be cut is not one of the ids that rule means anything about,
+        # and truncating first could only turn it into one by accident.
+        is_idle = device_is_idle(s.app_id, s.is_stand_by)
+        app_id = clip(s.app_id, MAX_MESSAGE)
         display_name = clip(s.display_name, MAX_MESSAGE)
-        is_idle = device_is_idle(app_id, s.is_stand_by)
 
         # volume_level/volume_muted are None until the first status update lands.
         volume_level = round(s.volume_level, 2) if s.volume_level is not None else None

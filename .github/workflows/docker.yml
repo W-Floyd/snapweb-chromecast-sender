@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
+  # Run the test job on pull requests too. Gating only pushes to main meant the
+  # checks below first ran on the commit that had already landed, which is the
+  # one moment they cannot stop anything; the build job is skipped here because
+  # there is nothing to publish for a branch.
+  pull_request:
+    branches: [main]
 
 jobs:
   # The image build compiles the binary, so a syntax error already fails the
@@ -32,6 +38,7 @@ jobs:
 
   build:
     needs: test
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: read

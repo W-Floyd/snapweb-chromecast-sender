@@ -73,16 +73,36 @@ Neither is installed outside the Docker image, so `/api/devices/*` degrades to e
 rows when running `go run` on a dev machine. That's expected. **No test may shell out
 to `catt` or to the status helper** — keep it that way.
 
-The way the *rest* of the casting logic is still tested is three function variables —
-`probeDevice`, `castSite`, `stopCast` — that the tests substitute (`withFakeCatt`,
-`withProbe`). They exist because `monitorDevices` is the only code that both probes a
-device and decides whether to cast to it, so none of its ordering could be exercised
-while it shelled out directly, and the same went for the goroutines in
-`/api/devices/cast` and `/stop`, which are where a failure *becomes* a `castErrors`
-entry. A new subprocess call in that path belongs behind one of them, and a new
-decision in the loop belongs in a test that drives it — the fake probe deliberately
-applies the observation the real one does, because the loop reads `castStates`, not
-the returned struct.
+The way the *rest* of the logic is still tested is five function variables —
+`probeDevice`, `castSite`, `stopCast`, `mdnsScan`, `tcpScanner` — that the tests
+substitute (`withFakeCatt`, `withProbe`, `withScanners`). They exist because
+`monitorDevices` is the only code that both probes a device and decides whether to cast
+to it, so none of its ordering could be exercised while it shelled out directly, and the
+same went for the goroutines in `/api/devices/cast` and `/stop`, which are where a
+failure *becomes* a `castErrors` entry. A new subprocess call in that path belongs behind
+one of them, and a new decision in the loop belongs in a test that drives it — the fake
+probe deliberately applies the observation the real one does, because the loop reads
+`castStates`, not the returned struct.
+
+The last two are `handleScan`'s pair of stages. An mDNS hit ends the stream early, so
+that whole branch — the `found` events, the count, the TCP fallback it skips — was
+unreachable in a test that may not run `catt`; and the fallback with no explicit subnet
+probes 254 hosts of whatever `localSubnets` finds, which is the LAN of the machine
+running the tests. `tcpScan` itself is exercised for real, against loopback: the
+`chromecastSetupPort` var is a variable only so a test can put a stand-in server on that
+port and reach the confirm step — dial, fetch `/setup/eureka_info`, decode, require a
+name — which decides whether a responding host is reported at all and otherwise needs a
+Chromecast on the test machine.
+
+`interpretStatusOutput` is the same split one layer down: `getPychromecastStatus` is now
+only the subprocess plumbing, and everything that *reads* the result — the diagnostic
+precedence, the stale-poll fallback, the app-id learner, the bounding of
+device-supplied text — is a pure-ish function a test can call directly. It decodes the
+payload into a **pointer** and refuses `nil`, exactly as `POST /api/config` does with its
+body and for the same reason: a bare `null` on stdout decodes into a value without
+error and leaves an empty `error` and `is_idle: false`, which reads as "the device is
+playing something" — a state nobody reported, written into `castStates` and rendered on
+the card.
 
 The layered timeouts are not asserted by hand: `TestStatusQueryTimeoutOutlastsTheScriptWatchdog`
 reads `OVERALL_TIMEOUT` and friends straight out of `cc_status.py` (no interpreter
@@ -151,7 +171,11 @@ whereas the duplicate note only says which row does the casting — and
 `autoCastTargets` claims a `deviceKey` for the first matching row *before* it looks at
 that row's URL, so a duplicated pair whose first row has the unusable URL is never
 cast and "only the first is auto-cast" was actively misleading. A row with auto-cast
-off skips the URL gates entirely, so it keeps the duplicate advisory.
+off skips the URL gates entirely, so it keeps the duplicate advisory — but a
+*different* one (`duplicateEntryWarningNoAuto`): "only the first is auto-cast" names a
+consequence that cannot apply to a row with the box unticked, and reads as though
+ticking it would be pointless. What is left is the cost that applies either way, which
+is that both rows show the same state and the same cast error.
 
 The implication runs one way only — a warned device may still be cast to (one with no
 IP is cast blind; the first row of a duplicated pair is the row that gets cast) — so
@@ -199,8 +223,10 @@ that `POST /api/config` interrupts through `configChanged`, and re-reads
 day, so a plain sleep on the value read at the top of the cycle applied a *lowered*
 interval up to 24h late and the save looked like it had done nothing. The deadline
 stays measured from the start of the wait, so a burst of saves can only shorten it,
-never postpone the next poll. `remainingWait` is a separate function so both of those
-are direct assertions rather than a test that has to wait out a real interval.
+never postpone the next poll. `remainingWait` and `awaitNextTick` are separate
+functions so all of that is a direct assertion rather than a test that has to wait out
+a real interval — `monitorLoop` itself cannot be called from a test at all, since it
+never returns.
 
 **A cast is reported before it happens.** `/api/devices/cast` and `/stop` answer
 immediately and run `catt` in a goroutine, so failures can't ride on the HTTP response.
@@ -229,8 +255,12 @@ included — that field carries the receiver app's own `display_name`, whose len
 decided by whoever wrote that app, and it is echoed in every status response for as
 long as the app is up. Python's side of the same bound is `clip`: the reader keeps
 only the first 64KB of stdout, and a *truncated* JSON object does not parse at all,
-so an unbounded traceback in `detail` would take the `error` field down with it and
-leave the caller with no diagnosis whatsoever.
+so one unbounded field takes the whole payload down with it — an unbounded traceback
+in `detail`, or an unbounded `app_id`, and the caller gets neither a status nor a
+diagnosis. Every device-supplied string in that payload is clipped for that reason,
+`app_id` included even though nothing renders it: it is compared against, and stored
+as, the id our own casts run under. `device_is_idle` is applied to the *raw* id, before
+the clip, so truncating cannot turn one id into another by accident.
 
 `DeviceStatus` carries `Host` as well as `Name` so the UI can tell whether its local
 device list still lines up with the server's. Pairing is by index; the identity check

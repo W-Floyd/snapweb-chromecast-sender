@@ -608,10 +608,19 @@ func duplicateDeviceKeys(devices []DeviceConfig) map[string]bool {
 	return dup
 }
 
-// duplicateEntryWarning is emitted for every row of a duplicated pair, from two
-// different places in configWarning — the position of this one advisory relative
-// to the URL checks is the difference between the two.
-const duplicateEntryWarning = "Another entry points at the same device — they share one cast state, and only the first is auto-cast."
+// The duplicate-entry advisory, in the two forms configWarning emits it in.
+//
+// Which one a row gets turns on whether auto-cast is on, because the second
+// clause is the actionable half and it is only true when something is casting:
+// telling a row with auto-cast *off* that "only the first is auto-cast" states a
+// consequence that cannot apply to it, and reads as though enabling the checkbox
+// were pointless. What is left in that case is the cost that applies either way —
+// both rows show the same state and the same cast error, so a failure on one is
+// rendered on both.
+const (
+	duplicateEntryWarning       = "Another entry points at the same device — they share one cast state, and only the first is auto-cast."
+	duplicateEntryWarningNoAuto = "Another entry points at the same device — they share one cast state, so both rows show the same status."
+)
 
 // configWarning reports an advisory problem with how a device is configured.
 // url is the device's effective cast URL: "nothing to cast" is a property of the
@@ -628,7 +637,7 @@ func configWarning(dev DeviceConfig, url string, duplicate bool) string {
 		// deviceKey costs something either way: both rows report the same state
 		// and the same cast error, so a failure on one is rendered on both.
 		if duplicate {
-			return duplicateEntryWarning
+			return duplicateEntryWarningNoAuto
 		}
 		return "" // nothing is monitoring it, so there is nothing to warn about
 	}
@@ -812,8 +821,15 @@ func (b *limitedBuffer) Write(p []byte) (int, error) {
 func (b *limitedBuffer) Bytes() []byte  { return b.buf.Bytes() }
 func (b *limitedBuffer) String() string { return b.buf.String() }
 
+// statusPayload is the single JSON object cc_status.py writes to stdout.
+type statusPayload struct {
+	AppID       string `json:"app_id"`
+	DisplayName string `json:"display_name"`
+	IsIdle      bool   `json:"is_idle"`
+	Error       string `json:"error"`
+}
+
 func getPychromecastStatus(ctx context.Context, dev DeviceConfig) DeviceStatus {
-	ds := DeviceStatus{Name: dev.Name, Host: dev.Host, State: "unknown"}
 	ctx, cancel := context.WithTimeout(ctx, statusQueryTimeout)
 	defer cancel()
 	// Keep stderr out of stdout: zeroconf/pychromecast log lines and Python
@@ -832,26 +848,41 @@ func getPychromecastStatus(ctx context.Context, dev DeviceConfig) DeviceStatus {
 	// whenever the subprocess happens to finish up to statusQueryTimeout later.
 	observedAt := time.Now()
 	runErr := cmd.Run()
+	return interpretStatusOutput(dev, stdout.Bytes(), stderr.Bytes(), runErr, ctx.Err(), observedAt)
+}
 
-	var result struct {
-		AppID       string `json:"app_id"`
-		DisplayName string `json:"display_name"`
-		IsIdle      bool   `json:"is_idle"`
-		Error       string `json:"error"`
-	}
-	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+// interpretStatusOutput turns one run of the status helper into a DeviceStatus,
+// and applies what it learned to the cast state. Separated from the subprocess
+// plumbing above so that every branch of it — the diagnostic precedence, the
+// stale-poll fallback, the app-id learner, the bounding of device-supplied text
+// — is assertable without running python3, which no test here may do.
+//
+// ctxErr is the query context's error, checked rather than derived so that a
+// timeout can be told from the caller giving up. observedAt is when the query
+// *began*; see observeCastState.
+func interpretStatusOutput(dev DeviceConfig, stdout, stderr []byte, runErr, ctxErr error, observedAt time.Time) DeviceStatus {
+	ds := DeviceStatus{Name: dev.Name, Host: dev.Host, State: "unknown"}
+
+	// Decoded into a *pointer* so that a bare `null` on stdout is distinguishable
+	// from an object, the same hazard POST /api/config guards against. Into a
+	// value it decodes without error and leaves the zero payload, whose empty
+	// Error and false IsIdle read as "the device is playing something" — a
+	// fabricated state, applied to castStates and reported on the card, from a
+	// helper that in fact told us nothing.
+	var result *statusPayload
+	if err := json.Unmarshal(stdout, &result); err != nil || result == nil {
 		// Report the most useful diagnostic available. Previously a missing
 		// python3 or an empty stdout produced an empty Error, leaving the UI
 		// with no explanation at all.
-		errMsg, outMsg := shortText(stderr.String()), shortText(stdout.String())
+		errMsg, outMsg := shortText(string(stderr)), shortText(string(stdout))
 		switch {
 		// Our own deadline is checked first, ahead of stderr. The script's 12s
 		// watchdog fires before this one, so reaching it means the script never got
 		// to speak — and stderr then holds nothing but zeroconf chatter, which was
 		// being quoted onto the device card as if it were the diagnosis.
-		case ctx.Err() == context.DeadlineExceeded:
+		case ctxErr == context.DeadlineExceeded:
 			ds.Error = fmt.Sprintf("status query for %s timed out after %s", dev.Host, statusQueryTimeout)
-		case ctx.Err() != nil:
+		case ctxErr != nil:
 			// Cancelled, not timed out — the caller (a browser that navigated away)
 			// gave up on us. Nothing was learned about the device either way.
 			ds.Error = "status query cancelled"
@@ -959,18 +990,30 @@ func autoCastTargets(devices []DeviceConfig, defaultURL string) []DeviceConfig {
 	return targets
 }
 
-// The three subprocess calls the casting logic makes, behind function variables.
+// The subprocess calls the casting and discovery logic makes, behind function
+// variables.
 //
 // monitorDevices is the only code that both probes a device and decides whether
 // to cast to it, so none of its ordering — the stale-URL re-cast, the takeover
 // gate, the skip on an unreachable device — could be exercised at all while it
 // shelled out directly; the same went for the goroutines in /api/devices/cast and
-// /stop, which are where a cast failure becomes a castErrors entry. Plain
-// variables rather than an interface: there is exactly one production
-// implementation of each, and only the tests ever substitute one.
+// /stop, which are where a cast failure becomes a castErrors entry. mdnsScan is
+// the same story for handleScan: an mDNS hit ends the stream early, and that
+// whole branch — the found events, the count, the TCP fallback it skips — was
+// unreachable in a test that may not run catt. Plain variables rather than an
+// interface: there is exactly one production implementation of each, and only
+// the tests ever substitute one.
 var (
 	probeDevice = getPychromecastStatus
-	castSite    = func(ctx context.Context, dev DeviceConfig, url string) (string, error) {
+	mdnsScan    = cattScan
+	// tcpScanner is seamed alongside mdnsScan so that handleScan's own decisions
+	// are assertable: which scanner runs for an explicit subnet, that the subnet
+	// reaches it, and that a give-up reason comes back out on the done event. The
+	// real one probes 254 hosts of whatever localSubnets finds, so a test that
+	// drove the no-subnet path through it would scan the LAN of the machine
+	// running it. tcpScan itself is exercised directly, against loopback.
+	tcpScanner = tcpScan
+	castSite   = func(ctx context.Context, dev DeviceConfig, url string) (string, error) {
 		return runCatt(ctx, 30*time.Second, append(cattDeviceArgs(dev), "cast_site", url)...)
 	}
 	stopCast = func(ctx context.Context, dev DeviceConfig) (string, error) {
@@ -1080,22 +1123,31 @@ func remainingWait(waitFrom time.Time) time.Duration {
 	return time.Until(waitFrom.Add(checkInterval()))
 }
 
+// awaitNextTick blocks until the check interval that began at waitFrom has
+// elapsed, re-reading it every time POST /api/config wakes us through
+// configChanged. Separate from monitorLoop, which cannot be called from a test
+// at all: it never returns, and the interruptibility is the part with a
+// regression behind it — a save that lowered the interval from near the one-day
+// ceiling otherwise took effect up to 24h later and looked like a no-op.
+func awaitNextTick(waitFrom time.Time) {
+	for {
+		d := remainingWait(waitFrom)
+		if d <= 0 {
+			return
+		}
+		t := time.NewTimer(d)
+		select {
+		case <-t.C:
+		case <-configChanged:
+			t.Stop()
+		}
+	}
+}
+
 func monitorLoop() {
 	for {
 		monitorDevices(context.Background())
-		waitFrom := time.Now()
-		for {
-			d := remainingWait(waitFrom)
-			if d <= 0 {
-				break
-			}
-			t := time.NewTimer(d)
-			select {
-			case <-t.C:
-			case <-configChanged:
-				t.Stop()
-			}
-		}
+		awaitNextTick(time.Now())
 	}
 }
 
@@ -1441,10 +1493,18 @@ func handleSubnets(w http.ResponseWriter, r *http.Request) {
 }
 
 // maxEurekaInfo bounds the /setup/eureka_info body we are willing to read from
-// a host that answered on port 8008. A genuine reply is a few KB.
+// a host that answered on the setup port. A genuine reply is a few KB.
 const maxEurekaInfo = 64 << 10
 
-// tcpScan probes each host in subnets on port 8008.
+// chromecastSetupPort is the unauthenticated HTTP port every Chromecast serves
+// /setup/eureka_info on, and the port the TCP fallback looks for. A variable
+// only so a test can point the scan at a local stand-in server: the confirm step
+// — dial, fetch, decode, require a name — is what decides whether a responding
+// host is reported as a device at all, and it cannot be reached otherwise
+// without a real Chromecast on the machine running the tests.
+var chromecastSetupPort = 8008
+
+// tcpScan probes each host in subnets on the Chromecast setup port.
 // Pass nil subnets to auto-detect from local interfaces.
 // onStatus receives human-readable status lines (including subnet info).
 // onFound is called immediately when a device is confirmed.
@@ -1471,7 +1531,7 @@ func tcpScan(ctx context.Context, subnets []string, onStatus func(string), onFou
 	for i, s := range subnets {
 		subnetLabels[i] = s + ".0/24"
 	}
-	onStatus(fmt.Sprintf("Probing %s — %d hosts on port 8008", strings.Join(subnetLabels, ", "), total))
+	onStatus(fmt.Sprintf("Probing %s — %d hosts on port %d", strings.Join(subnetLabels, ", "), total, chromecastSetupPort))
 
 	var (
 		checked int64
@@ -1527,13 +1587,14 @@ func tcpScan(ctx context.Context, subnets []string, onStatus func(string), onFou
 					return
 				}
 
-				conn, err := net.DialTimeout("tcp", h+":8008", 400*time.Millisecond)
+				addr := net.JoinHostPort(h, strconv.Itoa(chromecastSetupPort))
+				conn, err := net.DialTimeout("tcp", addr, 400*time.Millisecond)
 				if err != nil {
 					return
 				}
 				conn.Close()
 
-				req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+h+":8008/setup/eureka_info", nil)
+				req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+addr+"/setup/eureka_info", nil)
 				if err != nil {
 					return
 				}
@@ -1634,7 +1695,7 @@ func handleScan(w http.ResponseWriter, r *http.Request) {
 
 	if len(explicitSubnets) == 0 {
 		send(ScanEvent{Type: "status", Message: "Running mDNS scan via catt..."})
-		devices = cattScan(ctx)
+		devices = mdnsScan(ctx)
 		if len(devices) > 0 {
 			for i := range devices {
 				send(ScanEvent{Type: "found", Device: &devices[i]})
@@ -1645,7 +1706,7 @@ func handleScan(w http.ResponseWriter, r *http.Request) {
 		send(ScanEvent{Type: "status", Message: "mDNS scan found nothing — starting TCP fallback"})
 	}
 
-	devices, failure := tcpScan(
+	devices, failure := tcpScanner(
 		ctx,
 		explicitSubnets,
 		func(msg string) { send(ScanEvent{Type: "status", Message: msg}) },
