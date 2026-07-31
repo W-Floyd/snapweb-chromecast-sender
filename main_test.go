@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -140,6 +142,79 @@ func TestSaveConfigAtomicAndReadable(t *testing.T) {
 	}
 }
 
+// POST /api/config replaces the whole config, so a body that carries no value
+// must be refused rather than read as the empty value. `null` decodes into a
+// Config without error and leaves the zero value, which normalizeConfig turns
+// into a valid "no devices, no default URL, 60s" — every device deleted from
+// disk, every cast state pruned, and a 200 returned for it. A body with
+// content after the object is the same hazard by a different route: Decode
+// stops at the first value, so a concatenated or double-encoded payload
+// persisted only its first half.
+func TestPostConfigRejectsBodiesThatWouldSilentlyWipeIt(t *testing.T) {
+	dir := t.TempDir()
+	oldPath := cfgPath
+	cfgPath = filepath.Join(dir, "config.json")
+	defer func() { cfgPath = oldPath }()
+
+	original := Config{CheckInterval: 30, DefaultURL: "http://dash/", Devices: []DeviceConfig{{Name: "Lounge", Host: "1.2.3.4"}}}
+	cfgMu.Lock()
+	saved := cfg
+	cfg = original
+	cfgMu.Unlock()
+	defer func() {
+		cfgMu.Lock()
+		cfg = saved
+		cfgMu.Unlock()
+	}()
+	if err := saveConfig(original); err != nil {
+		t.Fatalf("saveConfig: %v", err)
+	}
+
+	for _, body := range []string{
+		"null",
+		`{"check_interval":30,"devices":[]} {"devices":[]}`,
+		`{"check_interval":30} trailing`,
+	} {
+		rec := httptest.NewRecorder()
+		handleConfig(rec, httptest.NewRequest(http.MethodPost, "/api/config", strings.NewReader(body)))
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("POST %q = %d, want 400", body, rec.Code)
+		}
+		cfgMu.RLock()
+		devices := len(cfg.Devices)
+		cfgMu.RUnlock()
+		if devices != 1 {
+			t.Errorf("POST %q left %d devices in the live config, want the original 1", body, devices)
+		}
+		data, err := os.ReadFile(cfgPath)
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		var onDisk Config
+		if err := json.Unmarshal(data, &onDisk); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if len(onDisk.Devices) != 1 || onDisk.DefaultURL != "http://dash/" {
+			t.Errorf("POST %q overwrote the config on disk: %+v", body, onDisk)
+		}
+	}
+
+	// A well-formed replacement must still get through, trailing newline and all
+	// — a JSON encoder writing to the wire adds one.
+	rec := httptest.NewRecorder()
+	handleConfig(rec, httptest.NewRequest(http.MethodPost, "/api/config",
+		strings.NewReader(`{"check_interval":45,"default_url":"http://new/","devices":[]}`+"\n")))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("valid POST = %d (%s), want 200", rec.Code, rec.Body)
+	}
+	cfgMu.RLock()
+	got := cfg
+	cfgMu.RUnlock()
+	if got.CheckInterval != 45 || got.DefaultURL != "http://new/" || len(got.Devices) != 0 {
+		t.Errorf("valid POST stored %+v", got)
+	}
+}
+
 func TestScanEventProgressAlwaysHasCounts(t *testing.T) {
 	// checked == 0 must still marshal, or the UI renders "undefined / N hosts".
 	data, err := json.Marshal(ScanEvent{Type: "progress", Checked: 0, Total: 254})
@@ -261,13 +336,13 @@ func TestCastErrorRecordedAndCleared(t *testing.T) {
 	}
 
 	// Long output is truncated without splitting a multi-byte rune.
-	setCastError(dev, strings.Repeat("é", maxCastErrLen*2))
+	setCastError(dev, strings.Repeat("é", maxStatusTextLen*2))
 	got := castError(dev)
 	if !utf8.ValidString(got) {
 		t.Errorf("truncated message is not valid UTF-8: %q", got)
 	}
-	if n := utf8.RuneCountInString(got); n != maxCastErrLen+1 { // +1 for the ellipsis
-		t.Errorf("truncated to %d runes, want %d", n, maxCastErrLen+1)
+	if n := utf8.RuneCountInString(got); n != maxStatusTextLen+1 { // +1 for the ellipsis
+		t.Errorf("truncated to %d runes, want %d", n, maxStatusTextLen+1)
 	}
 }
 
@@ -596,19 +671,19 @@ func TestUnaddressedDeviceIsNotProbed(t *testing.T) {
 // cast and silently stops re-casting, so the card has to say so.
 func TestAutoCastWithoutIPIsFlagged(t *testing.T) {
 	const ok = "http://dash/"
-	if configWarning(DeviceConfig{Name: "Lounge", AutoCast: true}, ok) == "" {
+	if configWarning(DeviceConfig{Name: "Lounge", AutoCast: true}, ok, false) == "" {
 		t.Error("an auto-cast device with no IP should be flagged")
 	}
 	// An IP switches it to the pychromecast helper, which reports the app id.
-	if got := configWarning(DeviceConfig{Name: "Lounge", Host: "1.2.3.4", AutoCast: true}, ok); got != "" {
+	if got := configWarning(DeviceConfig{Name: "Lounge", Host: "1.2.3.4", AutoCast: true}, ok, false); got != "" {
 		t.Errorf("a device with an IP needs no warning, got %q", got)
 	}
 	// Nothing is monitoring it, so there is nothing to warn about.
-	if got := configWarning(DeviceConfig{Name: "Lounge"}, ""); got != "" {
+	if got := configWarning(DeviceConfig{Name: "Lounge"}, "", false); got != "" {
 		t.Errorf("a manual-only device needs no warning, got %q", got)
 	}
 	// getLiveStatus already explains this one; do not pile a second line on it.
-	if got := configWarning(DeviceConfig{AutoCast: true}, ok); got != "" {
+	if got := configWarning(DeviceConfig{AutoCast: true}, ok, false); got != "" {
 		t.Errorf("an unaddressed device is already reported, got %q", got)
 	}
 }
@@ -618,15 +693,15 @@ func TestAutoCastWithoutIPIsFlagged(t *testing.T) {
 // going to do anything with it.
 func TestAutoCastWithoutUsableURLIsFlagged(t *testing.T) {
 	dev := DeviceConfig{Name: "Lounge", Host: "1.2.3.4", AutoCast: true}
-	if got := configWarning(dev, ""); got == "" {
+	if got := configWarning(dev, "", false); got == "" {
 		t.Error("an auto-cast device with no URL and no default should be flagged")
 	}
-	if got := configWarning(dev, "192.168.1.5/dash"); got == "" {
+	if got := configWarning(dev, "192.168.1.5/dash", false); got == "" {
 		t.Error("an auto-cast device with an unusable URL should be flagged")
 	}
 	// The URL problem is reported ahead of the missing IP: without a URL the
 	// device is never cast to at all, so it is the more fundamental of the two.
-	if got := configWarning(DeviceConfig{Name: "Lounge", AutoCast: true}, ""); !strings.Contains(got, "URL") {
+	if got := configWarning(DeviceConfig{Name: "Lounge", AutoCast: true}, "", false); !strings.Contains(got, "URL") {
 		t.Errorf("warning = %q, want the URL problem reported first", got)
 	}
 }
@@ -846,8 +921,8 @@ func TestCattFailureAlwaysExplains(t *testing.T) {
 	}
 	// A traceback on the pipe is repeated in every /api/devices/status response
 	// for as long as the failure stands, and rendered into a one-line card.
-	got := cattFailure(errors.New("exit status 1"), strings.Repeat("é", maxCastErrLen*3))
-	if n := utf8.RuneCountInString(got); n != maxCastErrLen+1 {
+	got := cattFailure(errors.New("exit status 1"), strings.Repeat("é", maxStatusTextLen*3))
+	if n := utf8.RuneCountInString(got); n != maxStatusTextLen+1 {
 		t.Errorf("long catt output not bounded: %d runes", n)
 	}
 	if !utf8.ValidString(got) {
@@ -913,5 +988,829 @@ func TestIsVirtualIface(t *testing.T) {
 		if isVirtualIface(n) {
 			t.Errorf("%q should not be treated as virtual", n)
 		}
+	}
+}
+
+// --- shared helpers for the handler tests -----------------------------------
+
+// withConfig installs c as the live config and restores the previous one.
+func withConfig(t *testing.T, c Config) {
+	t.Helper()
+	cfgMu.Lock()
+	saved := cfg
+	cfg = c
+	cfgMu.Unlock()
+	t.Cleanup(func() {
+		cfgMu.Lock()
+		cfg = saved
+		cfgMu.Unlock()
+	})
+}
+
+// withConfigPath points cfgPath at a fresh temp file and restores it after.
+func withConfigPath(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.json")
+	saved := cfgPath
+	cfgPath = path
+	t.Cleanup(func() { cfgPath = saved })
+	return path
+}
+
+// sseEvents pulls the JSON payloads out of a captured text/event-stream body.
+func sseEvents(t *testing.T, body string) []ScanEvent {
+	t.Helper()
+	var events []ScanEvent
+	for _, frame := range strings.Split(body, "\n\n") {
+		data, ok := strings.CutPrefix(strings.TrimSpace(frame), "data: ")
+		if !ok {
+			continue
+		}
+		var evt ScanEvent
+		if err := json.Unmarshal([]byte(data), &evt); err != nil {
+			t.Fatalf("unparseable SSE frame %q: %v", data, err)
+		}
+		events = append(events, evt)
+	}
+	return events
+}
+
+// --- duplicate config rows --------------------------------------------------
+
+// Two rows can name one device — the same IP typed twice, or an IP filled into a
+// row that another row already carries. Everything in castStates is keyed by the
+// single deviceKey they share, castURLs included, so with a different URL on each
+// row the monitor cast row one's page, judged it stale against row two's, cast
+// that, and repeated the pair on every tick: an always-on dashboard restarting
+// itself forever.
+func TestDuplicateDeviceKeys(t *testing.T) {
+	devices := []DeviceConfig{
+		{Name: "Lounge", Host: "1.2.3.4"},
+		{Name: "Renamed", Host: "1.2.3.4"}, // same IP, so the same key
+		{Name: "Kitchen", Host: "5.6.7.8"},
+		{Name: "Speaker"}, // no IP, keyed by name
+		{Name: "Speaker"},
+	}
+	dup := duplicateDeviceKeys(devices)
+	if !dup["host:1.2.3.4"] {
+		t.Error("two rows with the same IP were not reported as duplicates")
+	}
+	if !dup["name:Speaker"] {
+		t.Error("two host-less rows with the same name were not reported as duplicates")
+	}
+	if dup["host:5.6.7.8"] {
+		t.Error("a device that appears once was reported as a duplicate")
+	}
+	// A name and an IP that happen to read the same must not collide — the keys
+	// carry a prefix precisely so that they cannot.
+	dup = duplicateDeviceKeys([]DeviceConfig{{Name: "1.2.3.4"}, {Host: "1.2.3.4"}})
+	if len(dup) != 0 {
+		t.Errorf("name and host namespaces collided: %v", dup)
+	}
+	if len(duplicateDeviceKeys(nil)) != 0 {
+		t.Error("an empty list has no duplicates")
+	}
+}
+
+func TestConfigWarningFlagsDuplicateEntries(t *testing.T) {
+	dev := DeviceConfig{Name: "Lounge", Host: "1.2.3.4", AutoCast: true}
+	if got := configWarning(dev, "http://dash/", true); got == "" {
+		t.Error("a duplicated device entry should be flagged")
+	}
+	// Sharing a key costs something whether or not auto-cast is on: both rows
+	// report the same state and the same cast error, so a failure on one is
+	// rendered on both.
+	manual := DeviceConfig{Name: "Lounge", Host: "1.2.3.4"}
+	if got := configWarning(manual, "", true); got == "" {
+		t.Error("a duplicate should be flagged even without auto-cast")
+	}
+	// Still nothing to pile on for a row with no identifier at all: two blank
+	// rows share the key "name:", and getLiveStatus already explains each.
+	if got := configWarning(DeviceConfig{}, "", true); got != "" {
+		t.Errorf("an unaddressed device is already reported, got %q", got)
+	}
+}
+
+// --- autoCastTargets: every pre-network skip the monitor makes --------------
+
+func TestAutoCastTargetsSkips(t *testing.T) {
+	const def = "http://default/"
+	devices := []DeviceConfig{
+		{Name: "Off", Host: "1.1.1.1"},                   // auto-cast disabled
+		{Host: "2.2.2.2", AutoCast: true},                // uses the default URL
+		{AutoCast: true},                                 // no identifier at all
+		{Name: "NoURL", Host: "3.3.3.3", AutoCast: true}, // default covers it
+		{Name: "BadURL", Host: "4.4.4.4", URL: "--version", AutoCast: true},
+		{Name: "Own", Host: "5.5.5.5", URL: "http://own/", AutoCast: true},
+	}
+	got := autoCastTargets(devices, def)
+	want := []string{"2.2.2.2", "3.3.3.3", "5.5.5.5"}
+	if len(got) != len(want) {
+		t.Fatalf("targets = %+v, want hosts %v", got, want)
+	}
+	for i, h := range want {
+		if got[i].Host != h {
+			t.Errorf("target %d = %q, want %q (config order must be preserved)", i, got[i].Host, h)
+		}
+	}
+
+	// With no default URL, the two rows that relied on it drop out as well.
+	got = autoCastTargets(devices, "")
+	if len(got) != 1 || got[0].Host != "5.5.5.5" {
+		t.Errorf("with no default URL, targets = %+v, want only the row with its own URL", got)
+	}
+}
+
+// Only the first row of a duplicated pair is acted on, and always the same one:
+// alternating between them is what restarted the dashboard on every tick.
+func TestAutoCastTargetsActsOnOneRowPerDevice(t *testing.T) {
+	devices := []DeviceConfig{
+		{Name: "First", Host: "1.2.3.4", URL: "http://a/", AutoCast: true},
+		{Name: "Second", Host: "1.2.3.4", URL: "http://b/", AutoCast: true},
+	}
+	for i := 0; i < 3; i++ {
+		got := autoCastTargets(devices, "")
+		if len(got) != 1 {
+			t.Fatalf("run %d: targets = %+v, want exactly one row for one device", i, got)
+		}
+		if got[0].URL != "http://a/" {
+			t.Errorf("run %d: acted on %q, want the first row every time", i, got[0].URL)
+		}
+	}
+	// A duplicate keyed by name behaves the same way.
+	got := autoCastTargets([]DeviceConfig{
+		{Name: "Speaker", URL: "http://a/", AutoCast: true},
+		{Name: "Speaker", URL: "http://b/", AutoCast: true},
+	}, "")
+	if len(got) != 1 || got[0].URL != "http://a/" {
+		t.Errorf("name-keyed duplicate = %+v, want only the first row", got)
+	}
+}
+
+// The whole point of configWarning is that no skip is silent: a skipped device's
+// card reads a plain "Idle", identical to one auto-cast is happily managing. So
+// every addressable row the monitor drops must come with an explanation. The
+// converse does not hold — a device with no IP is cast to blind and warned about
+// anyway — so this only asserts the direction that hides a problem.
+func TestEverySkippedDeviceIsExplained(t *testing.T) {
+	const def = "http://default/"
+	devices := []DeviceConfig{
+		{Name: "Off", Host: "1.1.1.1"},
+		{Name: "NoIP", URL: "http://a/", AutoCast: true},
+		{Name: "BadURL", Host: "2.2.2.2", URL: "ftp://x/", AutoCast: true},
+		{Name: "Dup", Host: "3.3.3.3", URL: "http://a/", AutoCast: true},
+		{Name: "Dup2", Host: "3.3.3.3", URL: "http://b/", AutoCast: true},
+		{Name: "Fine", Host: "4.4.4.4", AutoCast: true},
+		{AutoCast: true},
+	}
+	for _, defaultURL := range []string{def, ""} {
+		targets := map[string]bool{}
+		for _, d := range autoCastTargets(devices, defaultURL) {
+			targets[deviceKey(d)+"|"+d.Name] = true
+		}
+		dups := duplicateDeviceKeys(devices)
+		for _, d := range devices {
+			if targets[deviceKey(d)+"|"+d.Name] {
+				// Acted on, so nothing to check: a device the monitor is casting to
+				// can still carry an advisory (it is cast blind without an IP, and the
+				// first row of a duplicated pair is the one that gets cast).
+				continue
+			}
+			if !d.AutoCast || (d.Name == "" && d.Host == "") {
+				continue // not monitored, or already reported by getLiveStatus
+			}
+			if configWarning(d, effectiveURL(d, defaultURL), dups[deviceKey(d)]) == "" {
+				t.Errorf("default %q: device %+v was skipped with no explanation", defaultURL, d)
+			}
+		}
+	}
+}
+
+// --- GET/POST /api/config ---------------------------------------------------
+
+func TestHandleConfigGET(t *testing.T) {
+	withConfig(t, Config{CheckInterval: 45, DefaultURL: "http://dash/", Devices: []DeviceConfig{}})
+
+	rec := httptest.NewRecorder()
+	handleConfig(rec, httptest.NewRequest(http.MethodGet, "/api/config", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET = %d", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q", ct)
+	}
+	// devices must marshal as [] and never null: the UI reads config.devices.length
+	// straight out of this response.
+	if !strings.Contains(rec.Body.String(), `"devices":[]`) {
+		t.Errorf("empty device list did not marshal as []: %s", rec.Body)
+	}
+
+	for _, method := range []string{http.MethodPut, http.MethodDelete, http.MethodPatch} {
+		rec := httptest.NewRecorder()
+		handleConfig(rec, httptest.NewRequest(method, "/api/config", nil))
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Errorf("%s /api/config = %d, want 405", method, rec.Code)
+		}
+	}
+}
+
+// GET must not hand out the live slice: the caller would then be reading the
+// device list while a POST reslices it.
+func TestHandleConfigGETCopiesTheDeviceSlice(t *testing.T) {
+	withConfig(t, Config{CheckInterval: 60, Devices: []DeviceConfig{{Name: "Lounge"}}})
+
+	rec := httptest.NewRecorder()
+	handleConfig(rec, httptest.NewRequest(http.MethodGet, "/api/config", nil))
+	var got Config
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	got.Devices[0].Name = "mutated"
+	cfgMu.RLock()
+	live := cfg.Devices[0].Name
+	cfgMu.RUnlock()
+	if live != "Lounge" {
+		t.Errorf("live config was mutated through the response: %q", live)
+	}
+}
+
+// An over-long body is a different failure from a malformed one. MaxBytesReader
+// surfaces it as an ordinary decode error, so it used to be reported as "400 —
+// your JSON is bad", sending the caller after a syntax error that is not there.
+func TestOversizedBodiesAreRejectedAsTooLarge(t *testing.T) {
+	withConfigPath(t)
+	withConfig(t, Config{CheckInterval: 60, Devices: []DeviceConfig{}})
+
+	big := `{"default_url":"` + strings.Repeat("x", 2<<20) + `"}`
+	cases := []struct {
+		name    string
+		path    string
+		handler func(http.ResponseWriter, *http.Request)
+	}{
+		{"config", "/api/config", handleConfig},
+		{"cast", "/api/devices/cast", handleCast},
+		{"stop", "/api/devices/stop", handleStop},
+	}
+	for _, c := range cases {
+		rec := httptest.NewRecorder()
+		c.handler(rec, httptest.NewRequest(http.MethodPost, c.path, strings.NewReader(big)))
+		if rec.Code != http.StatusRequestEntityTooLarge {
+			t.Errorf("%s: oversized body = %d, want 413", c.name, rec.Code)
+		}
+		if !strings.Contains(rec.Body.String(), "at most") {
+			t.Errorf("%s: 413 body does not name the limit: %s", c.name, rec.Body)
+		}
+	}
+}
+
+// A rejected write must not be published: applying first left the monitor acting
+// on a config the disk never received, so the user saw a 500 and a restart
+// silently reverted the behaviour they thought they had lost.
+func TestFailedSaveNeitherPublishesNorPrunes(t *testing.T) {
+	// A path inside a directory that does not exist, so CreateTemp fails.
+	saved := cfgPath
+	cfgPath = filepath.Join(t.TempDir(), "missing-dir", "config.json")
+	defer func() { cfgPath = saved }()
+
+	kept := DeviceConfig{Name: "Lounge", Host: "1.2.3.4"}
+	withConfig(t, Config{CheckInterval: 30, Devices: []DeviceConfig{kept}})
+	resetCastState()
+	setCastState(kept, true, "http://dash/")
+
+	rec := httptest.NewRecorder()
+	handleConfig(rec, httptest.NewRequest(http.MethodPost, "/api/config",
+		strings.NewReader(`{"check_interval":99,"devices":[]}`)))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("unwritable config = %d, want 500", rec.Code)
+	}
+	cfgMu.RLock()
+	got := cfg
+	cfgMu.RUnlock()
+	if got.CheckInterval != 30 || len(got.Devices) != 1 {
+		t.Errorf("a failed save was published anyway: %+v", got)
+	}
+	if !isCasting(kept) {
+		t.Error("a failed save pruned the cast state of a device that is still configured")
+	}
+}
+
+// A successful save is what prunes: devices can be renamed, re-addressed or
+// deleted here, and their state would otherwise linger for the process lifetime.
+func TestSuccessfulSavePrunesRemovedDevices(t *testing.T) {
+	withConfigPath(t)
+	gone := DeviceConfig{Name: "Gone", Host: "1.2.3.4"}
+	stays := DeviceConfig{Name: "Stays", Host: "5.6.7.8"}
+	withConfig(t, Config{CheckInterval: 30, Devices: []DeviceConfig{gone, stays}})
+	resetCastState()
+	setCastState(gone, true, "http://dash/")
+	setCastState(stays, true, "http://dash/")
+
+	rec := httptest.NewRecorder()
+	handleConfig(rec, httptest.NewRequest(http.MethodPost, "/api/config",
+		strings.NewReader(`{"check_interval":30,"devices":[{"name":"Stays","host":"5.6.7.8"}]}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("save = %d (%s)", rec.Code, rec.Body)
+	}
+	if isCasting(gone) {
+		t.Error("a removed device kept its cast state")
+	}
+	if !isCasting(stays) {
+		t.Error("a device that is still configured lost its cast state")
+	}
+}
+
+// The interval is re-read only when the monitor is woken, and POST must never
+// block on that wake-up: the monitor can be mid-cast and tens of seconds away
+// from looking at the channel.
+func TestSavingSignalsTheMonitorWithoutBlocking(t *testing.T) {
+	withConfigPath(t)
+	withConfig(t, Config{CheckInterval: 60, Devices: []DeviceConfig{}})
+	// Start with the signal already pending, which is the case that would block
+	// on an unbuffered or unguarded send.
+	select {
+	case configChanged <- struct{}{}:
+	default:
+	}
+	t.Cleanup(func() {
+		select {
+		case <-configChanged:
+		default:
+		}
+	})
+
+	done := make(chan int, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		handleConfig(rec, httptest.NewRequest(http.MethodPost, "/api/config",
+			strings.NewReader(`{"check_interval":20,"devices":[]}`)))
+		done <- rec.Code
+	}()
+	select {
+	case code := <-done:
+		if code != http.StatusOK {
+			t.Fatalf("save = %d", code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("POST /api/config blocked waiting for the monitor to notice")
+	}
+}
+
+// --- loadConfig -------------------------------------------------------------
+
+func TestLoadConfig(t *testing.T) {
+	path := withConfigPath(t)
+	withConfig(t, Config{})
+
+	// No file yet: usable defaults, and a non-nil device list.
+	loadConfig()
+	cfgMu.RLock()
+	got := cfg
+	cfgMu.RUnlock()
+	if got.CheckInterval != 60 || got.Devices == nil || len(got.Devices) != 0 {
+		t.Errorf("missing config = %+v, want defaults", got)
+	}
+
+	// A malformed file must not leave cfg half-populated with a mix of defaults
+	// and file contents — it is decoded into a scratch value for that reason.
+	if err := os.WriteFile(path, []byte(`{"check_interval": 30, "devices": [{"name":`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	loadConfig()
+	cfgMu.RLock()
+	got = cfg
+	cfgMu.RUnlock()
+	if got.CheckInterval != 60 || len(got.Devices) != 0 {
+		t.Errorf("malformed config = %+v, want defaults only", got)
+	}
+
+	// A valid file is normalized on the way in, so what the monitor acts on and
+	// what GET /api/config reports cannot disagree with the stored value.
+	if err := os.WriteFile(path, []byte(`{"check_interval":2,"default_url":"  http://dash/  ","devices":[{"name":" Lounge ","host":" 1.2.3.4 ","url":" http://x/ "}]}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	loadConfig()
+	cfgMu.RLock()
+	got = cfg
+	cfgMu.RUnlock()
+	if got.CheckInterval != minCheckInterval {
+		t.Errorf("interval = %d, want the floor %d", got.CheckInterval, minCheckInterval)
+	}
+	if got.DefaultURL != "http://dash/" {
+		t.Errorf("default URL = %q, want trimmed", got.DefaultURL)
+	}
+	if len(got.Devices) != 1 {
+		t.Fatalf("devices = %+v", got.Devices)
+	}
+	if d := got.Devices[0]; d.Name != "Lounge" || d.Host != "1.2.3.4" || d.URL != "http://x/" {
+		t.Errorf("device not trimmed on load: %+v", d)
+	}
+}
+
+// --- /api/devices/cast and /stop -------------------------------------------
+
+// Neither handler may reach catt without an addressable device and, for a cast,
+// a URL catt's cast_site can actually be given.
+func TestCastAndStopValidation(t *testing.T) {
+	for _, method := range []string{http.MethodGet, http.MethodPut, http.MethodDelete} {
+		for name, h := range map[string]func(http.ResponseWriter, *http.Request){"cast": handleCast, "stop": handleStop} {
+			rec := httptest.NewRecorder()
+			h(rec, httptest.NewRequest(method, "/api/devices/"+name, nil))
+			if rec.Code != http.StatusMethodNotAllowed {
+				t.Errorf("%s %s = %d, want 405", method, name, rec.Code)
+			}
+		}
+	}
+
+	castCases := []struct{ body, wantIn string }{
+		// Reported separately: one message covering both read as though the device
+		// itself were the problem when only the URL was blank.
+		{`{"url":"http://dash/"}`, "name or host required"},
+		{`{"name":"   ","host":"  ","url":"http://dash/"}`, "name or host required"},
+		{`{"name":"Lounge"}`, "url required"},
+		{`{"name":"Lounge","url":"   "}`, "url required"},
+		// catt reads a "-"-prefixed positional as a flag, and one it accepts makes
+		// it exit 0 without casting — recorded as a success, which then arms the
+		// app-id learner to adopt whatever is really running on the device.
+		{`{"name":"Lounge","url":"--version"}`, "absolute http"},
+		{`{"name":"Lounge","url":"file:///etc/passwd"}`, "absolute http"},
+		{`{"name":"Lounge","url":"dashboard"}`, "absolute http"},
+		{`not json`, ""},
+		{`null`, "name or host required"},
+	}
+	for _, c := range castCases {
+		rec := httptest.NewRecorder()
+		handleCast(rec, httptest.NewRequest(http.MethodPost, "/api/devices/cast", strings.NewReader(c.body)))
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("cast %s = %d, want 400", c.body, rec.Code)
+		}
+		if c.wantIn != "" && !strings.Contains(rec.Body.String(), c.wantIn) {
+			t.Errorf("cast %s said %q, want it to mention %q", c.body, strings.TrimSpace(rec.Body.String()), c.wantIn)
+		}
+	}
+
+	for _, body := range []string{`{}`, `{"name":"  "}`, `null`, `not json`} {
+		rec := httptest.NewRecorder()
+		handleStop(rec, httptest.NewRequest(http.MethodPost, "/api/devices/stop", strings.NewReader(body)))
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("stop %s = %d, want 400", body, rec.Code)
+		}
+	}
+}
+
+// --- /api/devices/status ----------------------------------------------------
+
+func TestHandleDeviceStatus(t *testing.T) {
+	withConfig(t, Config{CheckInterval: 60, Devices: []DeviceConfig{}})
+
+	for _, method := range []string{http.MethodPost, http.MethodPut} {
+		rec := httptest.NewRecorder()
+		handleDeviceStatus(rec, httptest.NewRequest(method, "/api/devices/status", nil))
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Errorf("%s = %d, want 405", method, rec.Code)
+		}
+	}
+
+	// An empty list must marshal as [] and never null — the UI iterates it.
+	rec := httptest.NewRecorder()
+	handleDeviceStatus(rec, httptest.NewRequest(http.MethodGet, "/api/devices/status", nil))
+	if got := strings.TrimSpace(rec.Body.String()); got != "[]" {
+		t.Errorf("no devices = %q, want []", got)
+	}
+}
+
+// One entry per configured device, in config order, each carrying the identity
+// of the device it describes. The UI pairs them up by index and checks that
+// identity to notice when its local list has drifted.
+//
+// Every row here has a host, so each is answered by the pychromecast helper and
+// never by catt — which the tests must not invoke. The helper is pointed at a
+// path that does not exist, so the probes fail immediately and identically.
+func TestHandleDeviceStatusIsOrderedAndIdentified(t *testing.T) {
+	savedScript := statusScript
+	statusScript = filepath.Join(t.TempDir(), "does-not-exist.py")
+	defer func() { statusScript = savedScript }()
+
+	resetCastState()
+	devices := []DeviceConfig{
+		{Name: "A", Host: "127.0.0.1"},
+		{Host: "127.0.0.2"}, // host-only, so its Name is ""
+		{Name: "C", Host: "127.0.0.3"},
+		{Name: "Dup", Host: "127.0.0.3", AutoCast: true, URL: "http://dash/"},
+	}
+	withConfig(t, Config{CheckInterval: 60, Devices: devices})
+
+	rec := httptest.NewRecorder()
+	handleDeviceStatus(rec, httptest.NewRequest(http.MethodGet, "/api/devices/status", nil))
+	var got []DeviceStatus
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal %s: %v", rec.Body, err)
+	}
+	if len(got) != len(devices) {
+		t.Fatalf("got %d statuses for %d devices", len(got), len(devices))
+	}
+	for i, d := range devices {
+		if got[i].Name != d.Name || got[i].Host != d.Host {
+			t.Errorf("status %d = %+v, want the identity of %+v", i, got[i], d)
+		}
+		if got[i].Error == "" {
+			t.Errorf("status %d has no explanation for an unreachable probe: %+v", i, got[i])
+		}
+	}
+	// The last two rows share one IP, so both are told so — the flag is computed
+	// from the whole list, which is why handleDeviceStatus and not getDeviceStatus
+	// works it out.
+	for _, i := range []int{2, 3} {
+		if !strings.Contains(got[i].Warning, "same device") {
+			t.Errorf("status %d = %+v, want the duplicate advisory", i, got[i])
+		}
+	}
+	if got[0].Warning != "" {
+		t.Errorf("status 0 = %+v, want no advisory for a device that appears once", got[0])
+	}
+}
+
+// The two advisories the device cannot report for itself are merged on top of
+// the live status, and which one wins where is the whole point of the layer.
+func TestMergeStatusAdvisories(t *testing.T) {
+	live := DeviceStatus{Name: "Lounge", Host: "1.2.3.4", State: "Idle"}
+
+	// A device with nothing to say gets the last cast failure, or a failed cast
+	// is indistinguishable from one that never happened: the card reads "Idle".
+	got := mergeStatusAdvisories(live, "Chromecast not found", "")
+	if got.Error != "Chromecast not found" {
+		t.Errorf("error = %q, want the recorded cast failure", got.Error)
+	}
+
+	// The live result wins when both have something to say: it is the newer and
+	// the more specific of the two.
+	withLive := live
+	withLive.Error = "192.168.1.5 is not reachable on port 8009"
+	got = mergeStatusAdvisories(withLive, "Chromecast not found", "")
+	if got.Error != withLive.Error {
+		t.Errorf("error = %q, want the live result to win", got.Error)
+	}
+
+	// A warning never lands in Error. Recorded there it would still be there next
+	// tick, masking every real failure that followed it.
+	got = mergeStatusAdvisories(live, "", "No IP set")
+	if got.Error != "" {
+		t.Errorf("a warning leaked into error: %q", got.Error)
+	}
+	if got.Warning != "No IP set" {
+		t.Errorf("warning = %q", got.Warning)
+	}
+	// And it is set unconditionally: a device whose problem has been fixed must
+	// lose the advisory rather than keep the previous poll's.
+	got = mergeStatusAdvisories(DeviceStatus{Warning: "stale"}, "", "")
+	if got.Warning != "" {
+		t.Errorf("warning = %q, want it cleared", got.Warning)
+	}
+	// The rest of the live status passes through untouched.
+	if got = mergeStatusAdvisories(live, "e", "w"); got.Name != "Lounge" || got.Host != "1.2.3.4" || got.State != "Idle" {
+		t.Errorf("merge altered the live status: %+v", got)
+	}
+}
+
+// getDeviceStatus wires that merge to the live probe, the recorded cast error and
+// the config warning. Exercised on an unaddressed device, which is the one shape
+// getLiveStatus answers without a subprocess.
+func TestGetDeviceStatusUsesTheLiveResult(t *testing.T) {
+	resetCastState()
+	dev := DeviceConfig{}
+	setCastError(dev, "Chromecast not found")
+
+	ds := getDeviceStatus(context.Background(), dev, "http://dash/", false)
+	if !strings.Contains(ds.Error, "no name or IP") {
+		t.Errorf("error = %q, want the live explanation rather than the stale cast failure", ds.Error)
+	}
+	if ds.Warning != "" {
+		t.Errorf("warning = %q; getLiveStatus already explains this device", ds.Warning)
+	}
+}
+
+// The status helper may be missing, unreadable, or python3 itself may not be
+// installed. Every one of those has to produce a message: an empty Error reads
+// as success, and the device would be reported as playing.
+func TestPychromecastStatusAlwaysExplainsItself(t *testing.T) {
+	saved := statusScript
+	statusScript = filepath.Join(t.TempDir(), "does-not-exist.py")
+	defer func() { statusScript = saved }()
+
+	resetCastState()
+	ds := getPychromecastStatus(context.Background(), DeviceConfig{Name: "Lounge", Host: "127.0.0.1"})
+	if ds.Error == "" {
+		t.Error("a helper that cannot run must still explain itself")
+	}
+	if ds.State != "unknown" {
+		t.Errorf("state = %q, want \"unknown\"", ds.State)
+	}
+	if ds.Host != "127.0.0.1" || ds.Name != "Lounge" {
+		t.Errorf("status lost the device identity: %+v", ds)
+	}
+	// Nothing was learned about the device, so no cast state may be invented.
+	if isCasting(DeviceConfig{Name: "Lounge", Host: "127.0.0.1"}) {
+		t.Error("a failed probe marked the device as casting")
+	}
+}
+
+// A cancelled probe is not a timeout and not a device fault. Quoting zeroconf
+// chatter from stderr as the diagnosis is what this ordering prevents.
+func TestPychromecastStatusReportsCancellation(t *testing.T) {
+	saved := statusScript
+	statusScript = filepath.Join(t.TempDir(), "does-not-exist.py")
+	defer func() { statusScript = saved }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	ds := getPychromecastStatus(ctx, DeviceConfig{Name: "Lounge", Host: "127.0.0.1"})
+	if !strings.Contains(ds.Error, "cancelled") {
+		t.Errorf("error = %q, want it to name the cancellation", ds.Error)
+	}
+}
+
+// --- /api/subnets -----------------------------------------------------------
+
+func TestHandleSubnets(t *testing.T) {
+	for _, method := range []string{http.MethodPost, http.MethodDelete} {
+		rec := httptest.NewRecorder()
+		handleSubnets(rec, httptest.NewRequest(method, "/api/subnets", nil))
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Errorf("%s = %d, want 405", method, rec.Code)
+		}
+	}
+
+	rec := httptest.NewRecorder()
+	handleSubnets(rec, httptest.NewRequest(http.MethodGet, "/api/subnets", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET = %d", rec.Code)
+	}
+	// Never null: the UI feeds this straight into an x-for over the datalist.
+	if strings.TrimSpace(rec.Body.String()) == "null" {
+		t.Error("no detected subnets marshalled as null, want []")
+	}
+	var cidrs []string
+	if err := json.Unmarshal(rec.Body.Bytes(), &cidrs); err != nil {
+		t.Fatalf("unmarshal %s: %v", rec.Body, err)
+	}
+	for _, c := range cidrs {
+		base, ok := strings.CutSuffix(c, ".0/24")
+		if !ok {
+			t.Errorf("suggested subnet %q is not a /24", c)
+			continue
+		}
+		// The suggestion has to survive the round trip back through parseSubnet,
+		// or picking it from the datalist yields "Invalid subnet".
+		if parseSubnet(c) != base {
+			t.Errorf("suggested subnet %q does not parse back to %q", c, base)
+		}
+		if ip := net.ParseIP(base + ".1"); ip == nil || !ip.IsPrivate() {
+			t.Errorf("suggested subnet %q is not private", c)
+		}
+	}
+}
+
+// --- /api/devices/scan ------------------------------------------------------
+
+// This endpoint probes every host on a /24, so nothing but a GET may start it.
+func TestHandleScanRejectsNonGET(t *testing.T) {
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodHead} {
+		rec := httptest.NewRecorder()
+		handleScan(rec, httptest.NewRequest(method, "/api/devices/scan", nil))
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Errorf("%s = %d, want 405", method, rec.Code)
+		}
+	}
+}
+
+// The reason has to ride on the terminating event: the UI overwrites its status
+// line when the stream ends, so a reason sent as a "status" was replaced by the
+// generic "No devices found" and never seen.
+func TestHandleScanReportsRefusalsOnTheDoneEvent(t *testing.T) {
+	rec := httptest.NewRecorder()
+	handleScan(rec, httptest.NewRequest(http.MethodGet, "/api/devices/scan?subnet=192.168.999", nil))
+	events := sseEvents(t, rec.Body.String())
+	if len(events) != 1 || events[0].Type != "done" {
+		t.Fatalf("invalid subnet produced %+v, want a single done event", events)
+	}
+	if !strings.Contains(events[0].Message, "Invalid subnet") {
+		t.Errorf("done message = %q, want it to name the bad subnet", events[0].Message)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "text/event-stream" {
+		t.Errorf("Content-Type = %q", ct)
+	}
+	// An invalid subnet must not leave the one-scan-at-a-time latch held, or the
+	// next attempt is turned away for the rest of the process lifetime.
+	if scanInFlight.Load() {
+		t.Error("a refused scan left scanInFlight set")
+	}
+}
+
+func TestHandleScanRefusesASecondScan(t *testing.T) {
+	scanInFlight.Store(true)
+	defer scanInFlight.Store(false)
+
+	rec := httptest.NewRecorder()
+	handleScan(rec, httptest.NewRequest(http.MethodGet, "/api/devices/scan", nil))
+	events := sseEvents(t, rec.Body.String())
+	if len(events) != 1 || events[0].Type != "done" {
+		t.Fatalf("events = %+v, want a single done event", events)
+	}
+	if !strings.Contains(events[0].Message, "already running") {
+		t.Errorf("done message = %q, want it to say a scan is in flight", events[0].Message)
+	}
+	// The latch belongs to the scan that is still running; refusing must not
+	// release it on that scan's behalf.
+	if !scanInFlight.Load() {
+		t.Error("refusing a second scan cleared the in-flight latch")
+	}
+}
+
+// --- identity and text helpers ---------------------------------------------
+
+// The prefixes are what stop a device named after an IP from sharing state with
+// the device at that IP.
+func TestDeviceKeyNamespacesNameAndHost(t *testing.T) {
+	byHost := deviceKey(DeviceConfig{Name: "Lounge", Host: "1.2.3.4"})
+	if byHost != "host:1.2.3.4" {
+		t.Errorf("deviceKey with a host = %q, want the IP to win", byHost)
+	}
+	if got := deviceKey(DeviceConfig{Name: "Lounge"}); got != "name:Lounge" {
+		t.Errorf("deviceKey without a host = %q", got)
+	}
+	if deviceKey(DeviceConfig{Name: "1.2.3.4"}) == deviceKey(DeviceConfig{Host: "1.2.3.4"}) {
+		t.Error("a name and an IP that read alike must not share a key")
+	}
+}
+
+func TestShortText(t *testing.T) {
+	if got := shortText("  spaced  "); got != "spaced" {
+		t.Errorf("shortText = %q, want it trimmed", got)
+	}
+	if got := shortText(""); got != "" {
+		t.Errorf("shortText(\"\") = %q", got)
+	}
+	// Exactly at the cap: no ellipsis, nothing dropped.
+	exact := strings.Repeat("a", maxStatusTextLen)
+	if got := shortText(exact); got != exact {
+		t.Errorf("a message exactly at the cap was altered: %d runes", utf8.RuneCountInString(got))
+	}
+	// One past it, sliced by runes so the result stays valid UTF-8.
+	long := strings.Repeat("é", maxStatusTextLen+1)
+	got := shortText(long)
+	if !utf8.ValidString(got) {
+		t.Errorf("truncated text is not valid UTF-8: %q", got)
+	}
+	if n := utf8.RuneCountInString(got); n != maxStatusTextLen+1 {
+		t.Errorf("truncated to %d runes, want %d including the ellipsis", n, maxStatusTextLen+1)
+	}
+}
+
+// The UI compares a status against its device to notice that its local list has
+// drifted from the server's. That only works while both sides agree on how an
+// empty host is encoded — omitted on both, so the two read as equal.
+func TestHostIsOmittedConsistently(t *testing.T) {
+	cfgJSON, err := json.Marshal(DeviceConfig{Name: "Lounge"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	statusJSON, err := json.Marshal(DeviceStatus{Name: "Lounge", State: "Idle"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, data := range [][]byte{cfgJSON, statusJSON} {
+		var m map[string]any
+		if err := json.Unmarshal(data, &m); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := m["host"]; ok {
+			t.Errorf("an empty host was emitted rather than omitted: %s", data)
+		}
+	}
+	// And a set host appears on both, so they can be compared at all.
+	statusJSON, _ = json.Marshal(DeviceStatus{Name: "Lounge", Host: "1.2.3.4"})
+	if !strings.Contains(string(statusJSON), `"host":"1.2.3.4"`) {
+		t.Errorf("status did not carry the device host: %s", statusJSON)
+	}
+}
+
+// A warning is advisory and an error is a failure; folding them into one field
+// would let a standing config problem mask every real cast failure that follows.
+func TestWarningAndErrorAreSeparateFields(t *testing.T) {
+	data, err := json.Marshal(DeviceStatus{Name: "A", State: "Idle", Error: "boom", Warning: "advice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(data, &m); err != nil {
+		t.Fatal(err)
+	}
+	if m["error"] != "boom" || m["warning"] != "advice" {
+		t.Errorf("status did not carry both fields: %s", data)
+	}
+	// Both omitted when empty, so the UI's x-show tests are false rather than
+	// showing an empty amber or red line.
+	data, _ = json.Marshal(DeviceStatus{Name: "A", State: "Idle"})
+	if strings.Contains(string(data), "error") || strings.Contains(string(data), "warning") {
+		t.Errorf("empty advisories were emitted: %s", data)
 	}
 }

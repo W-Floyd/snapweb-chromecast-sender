@@ -96,6 +96,18 @@ IP when available, name otherwise — because friendly names are *not* unique an
 leaks between devices otherwise. It's lost on restart (devices get re-cast on the next
 tick) and pruned on config save. Never key new state by name alone.
 
+Two config rows can nonetheless *share* one `deviceKey` — the same IP typed twice, or
+an IP filled into a row another row already carries — and they then share every map
+above, `castURLs` included. With a different URL on each row the monitor cast row
+one's page, judged it stale against row two's, cast that, and repeated the pair on
+every tick: an always-on dashboard restarting itself forever. `autoCastTargets` acts
+on the first such row only, and `duplicateDeviceKeys` feeds `configWarning` so the
+others say why they are inert.
+
+`autoCastTargets` is also where every skip `monitorDevices` makes *before* touching
+the network lives. Keeping it pure is what makes those skips testable at all — the
+rest of the loop cannot run in a test, because it shells out.
+
 Concretely (traced through catt 0.13.1, `cli.py` → `util.echo_status` →
 `controllers.cast_info`): `catt status` describes the *media* session, and a web page
 cast has none. DashCast does not support the Google media namespace, so `_is_idle` is
@@ -109,10 +121,14 @@ instead, because the monitor genuinely cannot watch it.
 `configWarning` is where *every* silent `continue` in `monitorDevices` gets explained.
 A skipped device is invisible — its card reads a plain "Idle" and looks identical to
 one auto-cast is happily managing — so a new skip condition needs a warning alongside
-it. It takes the *effective* URL (`effectiveURL`), not just the device, because "no URL
-and no default" is a property of the pair. Warnings, not `castErrors`: a standing
-config problem recorded as a fresh cast failure every tick would keep bumping
-`castActions` and suppress every status observation of that device for good.
+it. It takes the *effective* URL (`effectiveURL`) and a `duplicate` flag, not just the
+device, because "no URL and no default" and "two rows for one device" are properties
+of the device *and* its context, not of the device alone. Warnings, not `castErrors`:
+a standing config problem recorded as a fresh cast failure every tick would keep
+bumping `castActions` and suppress every status observation of that device for good.
+The implication runs one way only — a warned device may still be cast to (one with no
+IP is cast blind; the first row of a duplicated pair is the row that gets cast) — so
+`TestEverySkippedDeviceIsExplained` asserts only the direction that hides a problem.
 
 The full set of labels `catt status` can print is `Title:`, `Time:`, `Remaining time:`,
 `State:`, `Volume:` and `Volume muted:` — so `getLiveStatus` parses `State: ` and
@@ -166,7 +182,34 @@ already cancelled by the time they run.
 **No authentication anywhere.** This is a trusted-LAN tool. The scan endpoint probes
 every host on a /24, so don't expose it. `POST /api/config` caps its body with
 `http.MaxBytesReader` for this reason (an unbounded `json.Decode` will consume all
-available memory); the cast/stop handlers do not yet, and should if they grow.
+available memory), as do the cast and stop handlers. All three report the rejection
+through `rejectBody`: `MaxBytesReader` surfaces an over-long body as an ordinary
+decode error, so without it every one of them answered "400 — your JSON is
+malformed", sending the caller after a syntax error that is not there.
+
+That handler replaces the *whole* config, so it must never read "no value" as "the
+empty value". It decodes into a `*Config` and rejects `nil`: a body of `null`
+decodes into a `Config` without error, leaves the zero value, and `normalizeConfig`
+turns that into a perfectly valid empty config — every device deleted from disk,
+every cast state pruned, 200 returned. It also rejects anything after the object
+(`dec.More()`), because `Decode` stops at the first value and a concatenated or
+double-encoded body would otherwise persist only its first half.
+
+Everything a subprocess puts in a `DeviceStatus` goes through `shortText`, `State`
+included — that field carries the receiver app's own `display_name`, whose length is
+decided by whoever wrote that app, and it is echoed in every status response for as
+long as the app is up. Python's side of the same bound is `clip`: the reader keeps
+only the first 64KB of stdout, and a *truncated* JSON object does not parse at all,
+so an unbounded traceback in `detail` would take the `error` field down with it and
+leave the caller with no diagnosis whatsoever.
+
+`DeviceStatus` carries `Host` as well as `Name` so the UI can tell whether its local
+device list still lines up with the server's. Pairing is by index; the identity check
+is what catches an unsaved add or delete. `Name` alone was not enough — a host-only
+entry has none, so two of them both read `""` and deleting the first handed the
+second the deleted device's status. Both structs use `omitempty` on `Host` so the two
+sides compare equal, and the UI coalesces to `''` because a field typed into and
+cleared is `''` locally but absent on the wire.
 
 ### The scanner
 

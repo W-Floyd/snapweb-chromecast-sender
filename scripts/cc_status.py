@@ -18,8 +18,28 @@ CONNECT_TIMEOUT = 8     # waiting for the device's first status message
 DISCONNECT_TIMEOUT = 2  # clean shutdown of the socket client
 OVERALL_TIMEOUT = 12    # hard watchdog covering everything above
 
+# Caps on the two free-form strings in the payload. The reader buffers at most
+# 64KB of our stdout and drops the rest, and a *truncated* JSON object does not
+# parse at all — so an unbounded traceback (a broken pychromecast install prints
+# a long one, and chained exceptions make it longer) would not merely be clipped,
+# it would take the "error" field down with it and leave the caller with no
+# diagnosis whatsoever. The reader also shows only the first 400 characters of
+# the message, so nothing useful is lost by bounding these here.
+MAX_MESSAGE = 500
+MAX_DETAIL = 4000
+
 _emit_lock = threading.Lock()
 _emitted = False
+
+
+def clip(text, limit, keep_tail=False):
+    """Bound a free-form string, marking it where it was cut."""
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    # A traceback's last lines name the actual exception, so keep the tail of
+    # that one; for a message the opening words are what identify it.
+    return "…" + text[-limit:] if keep_tail else text[:limit] + "…"
 
 
 def emit(payload):
@@ -94,7 +114,10 @@ def main():
             sys.exit(1)
 
         app_id = s.app_id
-        display_name = (s.display_name or "").strip()
+        # Bounded like the error strings below: this is whatever the receiver app
+        # calls itself, it is rendered straight onto the device card, and nothing
+        # in the protocol says how long it may be.
+        display_name = clip(s.display_name, MAX_MESSAGE)
         # Treat an empty app_id like a missing one: some devices report "" rather
         # than None when nothing is running, and `app_id is None` alone let that
         # read as playing — the monitor then never re-cast the dashboard.
@@ -117,8 +140,11 @@ def main():
         # Some exceptions stringify to "" (e.g. bare socket errors). An empty
         # "error" reads as success on the Go side, which then reports the
         # device as playing, so always fall back to the exception type name.
-        message = str(e).strip() or type(e).__name__
-        emit({"error": message, "detail": traceback.format_exc()})
+        message = clip(str(e), MAX_MESSAGE) or type(e).__name__
+        emit({
+            "error": message,
+            "detail": clip(traceback.format_exc(), MAX_DETAIL, keep_tail=True),
+        })
         sys.exit(1)
     finally:
         # disconnect() first, watchdog.cancel() after. Cancelling first left the

@@ -167,7 +167,7 @@
             <label class="block text-xs text-slate-400 mb-1.5 font-medium">Check Interval (seconds)</label>
             <!-- max matches the server's clamp: past ~9.2e9 seconds the
                  monitor's sleep duration overflows and it stops sleeping. -->
-            <input type="number" x-model.number="config.check_interval" min="10" max="86400"
+            <input type="number" x-model.number="config.check_interval" min="10" max="86400" step="1"
                    class="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500/50 transition" />
             <p class="text-xs text-slate-500 mt-1">How often to check idle devices</p>
           </div>
@@ -323,9 +323,17 @@
             // the Go decoder rejects with an opaque 400. Coerce it here, and let
             // the server's response tell us what it actually stored (it clamps
             // the interval to a floor).
+            //
+            // Truncated, not just coerced: check_interval is a Go `int`, and a
+            // fractional value — which the number input accepts however it is
+            // stepped — fails to decode with "cannot unmarshal number 10.5 into
+            // Go struct field Config.check_interval of type int", shown verbatim
+            // in the toast. The server clamps the range; only the *type* has to
+            // be right before it gets there.
+            const interval = Math.trunc(Number(this.config.check_interval))
             const payload = {
               ...this.config,
-              check_interval: Number(this.config.check_interval) || 60,
+              check_interval: Number.isFinite(interval) && interval > 0 ? interval : 60,
             }
             const res = await fetch('/api/config', {
               method: 'POST',
@@ -362,15 +370,24 @@
           }
         },
 
-        // Match by position, not name: /api/devices/status returns one entry per
-        // configured device in config order, and friendly names are neither
-        // unique nor always set — a name lookup gave two same-named devices (or
-        // every not-yet-named row) the first match's state. The name check keeps
-        // us honest when the local list has unsaved adds/removes and the indexes
-        // no longer line up: better "unknown" than another device's status.
+        // Match by position, not by identity: /api/devices/status returns one
+        // entry per configured device in config order, and friendly names are
+        // neither unique nor always set — a name lookup gave two same-named
+        // devices (or every not-yet-named row) the first match's state.
+        //
+        // The identity check then keeps us honest when the local list has unsaved
+        // adds or removes and the indexes no longer line up: better "unknown"
+        // than another device's status. It has to cover *both* fields, because a
+        // device needs only one of them — two host-only entries both carry the
+        // name "", so deleting the first handed the second the deleted device's
+        // status, which is precisely what this guards against. Coalesced to ''
+        // on each side: host is omitempty in both directions, so a field the user
+        // has typed into and cleared is '' locally and absent on the wire.
         statusFor(device, i) {
           const s = this.statuses[i]
-          return s && s.name === device.name ? s : undefined
+          if (!s) return undefined
+          const same = (a, b) => (a || '') === (b || '')
+          return same(s.name, device.name) && same(s.host, device.host) ? s : undefined
         },
 
         scanPercent() {
@@ -496,7 +513,11 @@
         // than a boolean — the reason has to survive back to the caller, because
         // during a batch there is only one toast and it is the summary.
         async castDevice(device, notifyResult = true) {
-          const url = device.url || this.config.default_url
+          // Trim before the emptiness test, the way the server does before its
+          // own. A URL of nothing but spaces is truthy here but empty there, so
+          // it skipped this check and came back as the server's blunter "url
+          // required" 400 — for what is locally a device with no URL set.
+          const url = (device.url || '').trim() || (this.config.default_url || '').trim()
           if (!url) {
             const error = `no URL set for "${this.deviceLabel(device)}" (and no default URL)`
             if (notifyResult) this.notify(error, 'error')

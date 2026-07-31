@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -50,7 +51,15 @@ type Config struct {
 }
 
 type DeviceStatus struct {
-	Name  string `json:"name"`
+	Name string `json:"name"`
+	// Host echoes the device this status is for. The UI pairs a status with its
+	// device by index, and checks these two fields to notice when the indexes no
+	// longer line up (a local add or delete that has not been saved yet). Name
+	// alone was not enough to tell two devices apart: a host-only entry has none,
+	// so after deleting one of two such devices the survivor was handed the
+	// deleted device's status — the exact mis-attribution the check exists to
+	// prevent. omitempty matches DeviceConfig.Host, so the two compare equal.
+	Host  string `json:"host,omitempty"`
 	State string `json:"state"`
 	Error string `json:"error,omitempty"`
 	// Foreign marks a device playing an app that is not our cast — someone
@@ -295,27 +304,30 @@ func isCasting(dev DeviceConfig) bool {
 	return castStates[deviceKey(dev)]
 }
 
-// maxCastErrLen bounds what we keep from catt's output; a failure can print a
-// full Python traceback, and all of it would end up in every status response.
-const maxCastErrLen = 400
+// maxStatusTextLen bounds any subprocess-supplied string we put in a
+// DeviceStatus; a failure can print a full Python traceback, and all of it would
+// otherwise end up in every status response.
+const maxStatusTextLen = 400
 
-// shortError trims and bounds a subprocess message on its way into a
-// DeviceStatus. Every error we report is repeated in every /api/devices/status
-// response for as long as it stands, so an unbounded one — a Python traceback
-// from a broken pychromecast install is the realistic case — is paid on every
-// poll and rendered into a card sized for one line.
-func shortError(msg string) string {
+// shortText trims and bounds a subprocess-supplied string on its way into a
+// DeviceStatus. Everything we report there is repeated in every
+// /api/devices/status response for as long as it stands, so an unbounded one — a
+// Python traceback from a broken pychromecast install is the realistic case — is
+// paid on every poll and rendered into a card sized for one line. It applies to
+// the state as much as to errors: State carries the receiver app's own
+// display_name, and nothing in the cast protocol bounds that.
+func shortText(msg string) string {
 	msg = strings.TrimSpace(msg)
 	// Slice by runes, not bytes: a byte-slice can cut a multi-byte character in
 	// half and produce invalid UTF-8 in the JSON response.
-	if r := []rune(msg); len(r) > maxCastErrLen {
-		msg = string(r[:maxCastErrLen]) + "…"
+	if r := []rune(msg); len(r) > maxStatusTextLen {
+		msg = string(r[:maxStatusTextLen]) + "…"
 	}
 	return msg
 }
 
 func setCastError(dev DeviceConfig, msg string) {
-	msg = shortError(msg)
+	msg = shortText(msg)
 	k := deviceKey(dev)
 	castStatesMu.Lock()
 	castStates[k] = false
@@ -524,7 +536,7 @@ func runCatt(ctx context.Context, timeout time.Duration, args ...string) (string
 	// CombinedOutput grows without limit, and catt is the *likelier* of the two
 	// subprocesses to produce a Python traceback — pychromecast and zeroconf both
 	// log through it, and a scan that goes wrong can keep printing for the whole
-	// 30s budget. Only the first few hundred bytes are ever looked at (shortError
+	// 30s budget. Only the first few hundred bytes are ever looked at (shortText
 	// caps the message at 400 runes) and the opening lines are the useful part.
 	//
 	// One writer for both streams, as CombinedOutput does: os/exec special-cases
@@ -550,10 +562,10 @@ func runCatt(ctx context.Context, timeout time.Duration, args ...string) (string
 // subprocess killed by our timeout prints nothing at all), so falling back to
 // the exec error keeps us from reporting an empty explanation.
 func cattFailure(err error, out string) string {
-	if msg := shortError(out); msg != "" {
+	if msg := shortText(out); msg != "" {
 		return msg
 	}
-	return shortError(err.Error())
+	return shortText(err.Error())
 }
 
 // castableURL reports whether u is something catt's cast_site can be given.
@@ -577,16 +589,43 @@ func effectiveURL(dev DeviceConfig, defaultURL string) string {
 	return defaultURL
 }
 
+// duplicateDeviceKeys reports which deviceKeys appear on more than one config
+// row. Two rows can legitimately be typed for one device — the same IP entered
+// twice, or an IP added to a row that another row already carries — and they
+// then share a single deviceKey, and with it a single cast state, cast error
+// and recorded URL. See monitorDevices for what that costs.
+func duplicateDeviceKeys(devices []DeviceConfig) map[string]bool {
+	count := make(map[string]int, len(devices))
+	for _, d := range devices {
+		count[deviceKey(d)]++
+	}
+	dup := map[string]bool{}
+	for k, n := range count {
+		if n > 1 {
+			dup[k] = true
+		}
+	}
+	return dup
+}
+
 // configWarning reports an advisory problem with how a device is configured.
 // url is the device's effective cast URL: "nothing to cast" is a property of the
-// device and the global default together, not of the device alone.
+// device and the global default together, not of the device alone. duplicate
+// says another config row resolves to the same deviceKey, which is likewise a
+// property of the list rather than of the device.
 // Pure and free of any subprocess, so it can be tested without catt.
-func configWarning(dev DeviceConfig, url string) string {
-	if !dev.AutoCast {
-		return "" // nothing is monitoring it, so there is nothing to warn about
-	}
+func configWarning(dev DeviceConfig, url string, duplicate bool) string {
 	if dev.Name == "" && dev.Host == "" {
 		return "" // getLiveStatus already explains this one; do not pile on
+	}
+	// Ahead of the auto-cast gate below, because sharing a deviceKey costs
+	// something either way: both rows report the same state and the same cast
+	// error, so a failure on one is rendered on both.
+	if duplicate {
+		return "Another entry points at the same device — they share one cast state, and only the first is auto-cast."
+	}
+	if !dev.AutoCast {
+		return "" // nothing is monitoring it, so there is nothing to warn about
 	}
 	// monitorDevices skips both of the next two cases, and a skip is invisible:
 	// from the UI it is indistinguishable from auto-cast simply not working.
@@ -610,16 +649,32 @@ func configWarning(dev DeviceConfig, url string) string {
 	return ""
 }
 
-func getDeviceStatus(ctx context.Context, dev DeviceConfig, defaultURL string) DeviceStatus {
-	ds := getLiveStatus(ctx, dev)
-	// Surface the last failed cast/stop when the device itself has nothing to
-	// report. Otherwise a cast that failed is indistinguishable from one that
-	// never happened: the card just reads "Idle".
+// mergeStatusAdvisories folds onto a live status the two things the device
+// itself cannot tell us: why our last cast or stop failed, and a standing
+// problem with how it is configured.
+//
+// lastCastErr fills in only when the device has nothing to say, so that the live
+// result — the newer and more specific of the two — wins. Without the fallback a
+// cast that failed was indistinguishable from one that never happened: the card
+// just read "Idle". Warning is a separate field rather than more text in Error
+// for the opposite reason: a standing advisory recorded there would still be
+// there next tick, masking every real failure that followed it.
+//
+// Pure, so that rule is testable without a subprocess.
+func mergeStatusAdvisories(ds DeviceStatus, lastCastErr, warning string) DeviceStatus {
 	if ds.Error == "" {
-		ds.Error = castError(dev)
+		ds.Error = lastCastErr
 	}
-	ds.Warning = configWarning(dev, effectiveURL(dev, defaultURL))
+	ds.Warning = warning
 	return ds
+}
+
+func getDeviceStatus(ctx context.Context, dev DeviceConfig, defaultURL string, duplicate bool) DeviceStatus {
+	return mergeStatusAdvisories(
+		getLiveStatus(ctx, dev),
+		castError(dev),
+		configWarning(dev, effectiveURL(dev, defaultURL), duplicate),
+	)
 }
 
 func getLiveStatus(ctx context.Context, dev DeviceConfig) DeviceStatus {
@@ -628,10 +683,10 @@ func getLiveStatus(ctx context.Context, dev DeviceConfig) DeviceStatus {
 	// such row shares the deviceKey "name:", so their cast errors landed on each
 	// other. Say what is missing instead.
 	if dev.Name == "" && dev.Host == "" {
-		// Name is empty by definition here, but set it anyway: the UI pairs a
-		// status with its device by index *and* name, so every row it renders has
-		// to carry the field.
-		return DeviceStatus{Name: dev.Name, State: "unknown", Error: "device has no name or IP address"}
+		// Both are empty by definition here, but set them anyway: the UI pairs a
+		// status with its device by index and then checks the identity, so every row
+		// it renders has to carry the fields.
+		return DeviceStatus{Name: dev.Name, Host: dev.Host, State: "unknown", Error: "device has no name or IP address"}
 	}
 	if dev.Host != "" {
 		return getPychromecastStatus(ctx, dev)
@@ -639,7 +694,7 @@ func getLiveStatus(ctx context.Context, dev DeviceConfig) DeviceStatus {
 	// Fall back to catt when no host IP is configured.
 	args := append(cattDeviceArgs(dev), "status")
 	out, err := runCatt(ctx, 10*time.Second, args...)
-	ds := DeviceStatus{Name: dev.Name, State: "unknown"}
+	ds := DeviceStatus{Name: dev.Name, Host: dev.Host, State: "unknown"}
 	if err != nil {
 		ds.Error = cattFailure(err, out)
 		return ds
@@ -660,7 +715,9 @@ func getLiveStatus(ctx context.Context, dev DeviceConfig) DeviceStatus {
 	// is the device's own truth — PAUSED, BUFFERING — so it wins over our guess.
 	for _, line := range splitLines(out) {
 		if after, ok := strings.CutPrefix(line, "State: "); ok {
-			ds.State = strings.TrimSpace(after)
+			// Bounded: this comes off a 64KB buffer, and a line with no newline in
+			// it is all one "value".
+			ds.State = shortText(after)
 		}
 	}
 	return ds
@@ -726,7 +783,7 @@ func (b *limitedBuffer) Bytes() []byte  { return b.buf.Bytes() }
 func (b *limitedBuffer) String() string { return b.buf.String() }
 
 func getPychromecastStatus(ctx context.Context, dev DeviceConfig) DeviceStatus {
-	ds := DeviceStatus{Name: dev.Name, State: "unknown"}
+	ds := DeviceStatus{Name: dev.Name, Host: dev.Host, State: "unknown"}
 	ctx, cancel := context.WithTimeout(ctx, statusQueryTimeout)
 	defer cancel()
 	// Keep stderr out of stdout: zeroconf/pychromecast log lines and Python
@@ -756,7 +813,7 @@ func getPychromecastStatus(ctx context.Context, dev DeviceConfig) DeviceStatus {
 		// Report the most useful diagnostic available. Previously a missing
 		// python3 or an empty stdout produced an empty Error, leaving the UI
 		// with no explanation at all.
-		errMsg, outMsg := shortError(stderr.String()), shortError(stdout.String())
+		errMsg, outMsg := shortText(stderr.String()), shortText(stdout.String())
 		switch {
 		// Our own deadline is checked first, ahead of stderr. The script's 12s
 		// watchdog fires before this one, so reaching it means the script never got
@@ -773,14 +830,14 @@ func getPychromecastStatus(ctx context.Context, dev DeviceConfig) DeviceStatus {
 		case outMsg != "":
 			ds.Error = outMsg
 		case runErr != nil:
-			ds.Error = shortError(runErr.Error())
+			ds.Error = shortText(runErr.Error())
 		default:
 			ds.Error = "no status output from " + statusScript
 		}
 		return ds
 	}
 	if result.Error != "" {
-		ds.Error = shortError(result.Error)
+		ds.Error = shortText(result.Error)
 		return ds
 	}
 
@@ -814,12 +871,62 @@ func getPychromecastStatus(ctx context.Context, dev DeviceConfig) DeviceStatus {
 		ds.State = "Idle"
 		return ds
 	}
-	ds.State = result.DisplayName
+	// Bounded here and not only in the helper: State is the receiver app's own
+	// display_name, so its length is decided by whoever wrote that app, and it is
+	// echoed in every status response for as long as the app is up.
+	ds.State = shortText(result.DisplayName)
 	if ds.State == "" {
 		ds.State = "Playing"
 	}
 	ds.Foreign = isForeignApp(result.AppID)
 	return ds
+}
+
+// autoCastTargets narrows a device list to the rows monitorDevices will act on
+// this tick, keeping config order. It is every skip the monitor makes *before*
+// touching the network, gathered into one pure function: each of them is
+// invisible from the UI — a skipped device's card reads a plain "Idle", exactly
+// like one auto-cast is happily managing — so the set has to be both testable
+// without a subprocess and kept in step with what configWarning explains.
+func autoCastTargets(devices []DeviceConfig, defaultURL string) []DeviceConfig {
+	// Two config rows can resolve to one deviceKey — the same IP typed twice, or
+	// an IP filled into a row that another row already carries. All the state in
+	// castStates is keyed by that one key, castURLs included, so with a different
+	// URL on each row the tick cast row one's page, judged it stale against row
+	// two's, cast that, and did the same again next tick: an always-on dashboard
+	// restarting itself forever. Act on the first such row only, and always the
+	// same one, so the choice does not depend on which URL was edited last.
+	handled := make(map[string]bool, len(devices))
+
+	var targets []DeviceConfig
+	for _, dev := range devices {
+		if !dev.AutoCast {
+			continue
+		}
+		if dev.Name == "" && dev.Host == "" {
+			continue // nothing to target; see getLiveStatus
+		}
+		key := deviceKey(dev)
+		if handled[key] {
+			continue
+		}
+		handled[key] = true
+		// Both of the next two skips are reported to the UI by configWarning rather
+		// than through castErrors: they are standing configuration problems, so
+		// recording them as a fresh cast failure on every tick would keep bumping
+		// castActions and suppress every status observation of the device for good.
+		//
+		// The second is not cosmetic. catt reads a "-"-prefixed positional as a
+		// flag, and one it accepts makes it exit 0 without casting — which we would
+		// record as a success and then let the app-id learner adopt whatever is
+		// really running on the device as our own, fleet-wide.
+		url := effectiveURL(dev, defaultURL)
+		if url == "" || !castableURL(url) {
+			continue
+		}
+		targets = append(targets, dev)
+	}
+	return targets
 }
 
 func monitorDevices(ctx context.Context) {
@@ -828,26 +935,8 @@ func monitorDevices(ctx context.Context) {
 	defaultURL := cfg.DefaultURL
 	cfgMu.RUnlock()
 
-	for _, dev := range devices {
-		if !dev.AutoCast {
-			continue
-		}
-		if dev.Name == "" && dev.Host == "" {
-			continue // nothing to target; see getLiveStatus
-		}
+	for _, dev := range autoCastTargets(devices, defaultURL) {
 		url := effectiveURL(dev, defaultURL)
-		// Both skips are reported to the UI by configWarning rather than through
-		// castErrors: they are standing configuration problems, so recording them
-		// as a fresh cast failure on every tick would keep bumping castActions and
-		// suppress every status observation of the device for good.
-		//
-		// The second is not cosmetic. catt reads a "-"-prefixed positional as a
-		// flag, and one it accepts makes it exit 0 without casting — which we would
-		// record as a success and then let the app-id learner adopt whatever is
-		// really running on the device as our own, fleet-wide.
-		if url == "" || !castableURL(url) {
-			continue
-		}
 		// Poll the device itself when we can. Relying on the cached cast state
 		// alone means a device that drops the cast (reboot, someone else casts
 		// to it) is never recovered, because nothing clears the flag unless a
@@ -955,6 +1044,20 @@ func monitorLoop() {
 	}
 }
 
+// rejectBody answers a request whose body could not be decoded. A body stopped
+// by http.MaxBytesReader surfaces as an ordinary decode error, so every one of
+// these endpoints reported an over-long body as "400 — your JSON is malformed",
+// which sends the caller looking for a syntax error that is not there. Name the
+// limit and use the status that means it.
+func rejectBody(w http.ResponseWriter, err error) {
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		http.Error(w, fmt.Sprintf("request body must be at most %d bytes", tooLarge.Limit), http.StatusRequestEntityTooLarge)
+		return
+	}
+	http.Error(w, err.Error(), http.StatusBadRequest)
+}
+
 func handleConfig(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -970,11 +1073,33 @@ func handleConfig(w http.ResponseWriter, r *http.Request) {
 		// Bound the body — this endpoint is unauthenticated on the LAN, and
 		// json.Decode on an unbounded stream will happily consume all memory.
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-		var newCfg Config
-		if err := json.NewDecoder(r.Body).Decode(&newCfg); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+		// Decode into a *pointer* so a body of `null` is distinguishable from an
+		// object. Into a Config it decodes without error and leaves the zero
+		// value, which normalizeConfig then turns into a perfectly valid "no
+		// devices, no default URL, 60s" config — so a client that sent `null`
+		// (a serialiser given an absent value, a proxy rewriting the body) had
+		// every device deleted from disk and every cast state pruned, and got a
+		// 200 for it. This endpoint replaces the whole config, so it must not
+		// treat "no value" as "the empty value".
+		dec := json.NewDecoder(r.Body)
+		var decoded *Config
+		if err := dec.Decode(&decoded); err != nil {
+			rejectBody(w, err)
 			return
 		}
+		if decoded == nil {
+			http.Error(w, "config body must be a JSON object", http.StatusBadRequest)
+			return
+		}
+		// Decode stops at the end of the first value and ignores whatever follows,
+		// so a body that was concatenated or double-encoded applied its first half
+		// silently — and the half that was dropped is a device list. Refuse it
+		// rather than persist a partial config the caller never sent.
+		if dec.More() {
+			http.Error(w, "unexpected content after the config object", http.StatusBadRequest)
+			return
+		}
+		newCfg := *decoded
 		normalizeConfig(&newCfg)
 		// Persist before publishing, and serialise the whole write-then-publish
 		// so it stays atomic against a second POST. Applying first meant a failed
@@ -1482,6 +1607,11 @@ func handleDeviceStatus(w http.ResponseWriter, r *http.Request) {
 	defaultURL := cfg.DefaultURL
 	cfgMu.RUnlock()
 
+	// Computed once for the whole list rather than per device: whether a row is
+	// a duplicate is a property of the list, and monitorDevices acts on only the
+	// first row of each deviceKey.
+	dups := duplicateDeviceKeys(devices)
+
 	// Index-assigned rather than appended: append order is whichever device
 	// answered first, which reshuffles the list on every poll.
 	statuses := make([]DeviceStatus, len(devices))
@@ -1490,7 +1620,7 @@ func handleDeviceStatus(w http.ResponseWriter, r *http.Request) {
 		wg.Add(1)
 		go func(i int, d DeviceConfig) {
 			defer wg.Done()
-			statuses[i] = getDeviceStatus(r.Context(), d, defaultURL)
+			statuses[i] = getDeviceStatus(r.Context(), d, defaultURL, dups[deviceKey(d)])
 		}(i, dev)
 	}
 	wg.Wait()
@@ -1511,7 +1641,7 @@ func handleCast(w http.ResponseWriter, r *http.Request) {
 		URL  string `json:"url"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		rejectBody(w, err)
 		return
 	}
 	// Trim like normalizeConfig does. deviceKey is built from these, so an
@@ -1524,8 +1654,16 @@ func handleCast(w http.ResponseWriter, r *http.Request) {
 	// Either identifier will do — cattDeviceArgs prefers the IP, and auto-cast
 	// has always worked on a host-only device, so rejecting one here made the
 	// Cast button fail with a 400 on exactly the devices the monitor handles best.
-	if (req.Name == "" && req.Host == "") || req.URL == "" {
-		http.Error(w, "name or host, and url, required", http.StatusBadRequest)
+	//
+	// Reported separately: one message covering both left the UI showing "name or
+	// host, and url, required" for a device that has a perfectly good name and
+	// only a blank URL, which reads as though the device itself were the problem.
+	if req.Name == "" && req.Host == "" {
+		http.Error(w, "name or host required", http.StatusBadRequest)
+		return
+	}
+	if req.URL == "" {
+		http.Error(w, "url required", http.StatusBadRequest)
 		return
 	}
 	// Reject anything that is not an http(s) URL before handing it to catt as a
@@ -1568,7 +1706,7 @@ func handleStop(w http.ResponseWriter, r *http.Request) {
 		Host string `json:"host"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		rejectBody(w, err)
 		return
 	}
 	req.Name = strings.TrimSpace(req.Name)
