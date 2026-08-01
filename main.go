@@ -317,10 +317,8 @@ func isCasting(dev DeviceConfig) bool {
 // otherwise end up in every status response.
 const maxStatusTextLen = 400
 
-// maxLoggedDetailLen bounds the helper's "detail" field on its way to the log.
-// Matches MAX_DETAIL in cc_status.py, which is what a well-behaved helper has
-// already clipped it to; the bound is here because the field arrives from a
-// subprocess and nothing but this reader enforces that.
+// maxLoggedDetailLen bounds the helper's traceback on its way to the log, matching
+// MAX_DETAIL in cc_status.py.
 const maxLoggedDetailLen = 4000
 
 // shortText trims and bounds a subprocess-supplied string on its way into a
@@ -1167,23 +1165,14 @@ func monitorDevices(ctx context.Context) {
 	}
 }
 
-// checkInterval reads the monitor interval as a Duration.
+// checkInterval reads the monitor interval as a Duration. The bounds are
+// normalizeConfig's job and only its job — it is the single place clamping
+// happens, and a second clamp here meant the value the UI displayed and the value
+// the monitor waited out could differ with neither of them wrong.
 func checkInterval() time.Duration {
 	cfgMu.RLock()
-	interval := cfg.CheckInterval
-	cfgMu.RUnlock()
-	// Defensive clamp: normalizeConfig already guarantees both bounds, but
-	// this is where the value becomes a Duration, and both ends of the range
-	// produce a hot loop that hammers every device with status queries — too
-	// small directly, too large by overflowing the multiplication below into a
-	// negative duration that a sleep does not wait on at all.
-	if interval < minCheckInterval {
-		interval = minCheckInterval
-	}
-	if interval > maxCheckInterval {
-		interval = maxCheckInterval
-	}
-	return time.Duration(interval) * time.Second
+	defer cfgMu.RUnlock()
+	return time.Duration(cfg.CheckInterval) * time.Second
 }
 
 // remainingWait is how much of the current check interval monitorLoop still has
@@ -1345,49 +1334,28 @@ func cattScan(ctx context.Context) []DiscoveredDevice {
 	return parseCattScan(out)
 }
 
+// parseCattScan reads `catt scan` output, which is one device per line as
+//
+//	"<ip> - <friendly name> - <manufacturer> <model>"
+//
+// It once also parsed a labelled `Name:` / `Host:` form — a guess at the format,
+// and one catt has never printed, so discovery came back empty and fell silently
+// through to the slow TCP scan until the line form above was added. The guess was
+// then kept beside it, tests and all, parsing output nothing emits. Don't re-add
+// it "for robustness": if discovery returns nothing, this format is what changed.
 func parseCattScan(out string) []DiscoveredDevice {
 	var devices []DiscoveredDevice
-	var cur DiscoveredDevice
 	// One entry per host. mDNS answers arrive per interface, so a host that can
 	// see the LAN two ways (network_mode: host on a machine with wifi and
 	// ethernet up) gets listed twice — and the UI's device list is keyed by host,
 	// where a duplicate key makes Alpine throw and drop the whole list of
 	// discovered devices rather than just the repeat.
 	seen := map[string]bool{}
-	add := func(d DiscoveredDevice) {
-		if seen[d.Host] {
-			return
-		}
-		seen[d.Host] = true
-		devices = append(devices, d)
-	}
 	for _, raw := range splitLines(out) {
 		line := strings.TrimSpace(raw)
-		// Emit on whichever of the pair completes the device. Keying the append
-		// off "Host:" alone assumed Name always came first; the reverse order
-		// left the pair sitting in cur and the device was never reported.
-		if after, ok := strings.CutPrefix(line, "Name:"); ok {
-			cur.Name = strings.TrimSpace(after)
-			if cur.Name != "" && cur.Host != "" {
-				add(cur)
-				cur = DiscoveredDevice{}
-			}
-			continue
-		}
-		if after, ok := strings.CutPrefix(line, "Host:"); ok {
-			cur.Host = strings.TrimSpace(after)
-			if cur.Name != "" && cur.Host != "" {
-				add(cur)
-				cur = DiscoveredDevice{}
-			}
-			continue
-		}
-		// catt actually prints one device per line as
-		//   "<ip> - <friendly name> - <manufacturer> <model>"
-		// so the labelled form above never matched and mDNS discovery always
-		// came back empty, silently falling through to the TCP scan.
 		host, rest, ok := strings.Cut(line, " - ")
-		if !ok || net.ParseIP(strings.TrimSpace(host)) == nil {
+		host = strings.TrimSpace(host)
+		if !ok || net.ParseIP(host) == nil || seen[host] {
 			continue
 		}
 		name := rest
@@ -1399,7 +1367,8 @@ func parseCattScan(out string) []DiscoveredDevice {
 			name = rest[:i] // trailing " - <manufacturer> <model>"
 		}
 		if name = strings.TrimSpace(name); name != "" {
-			add(DiscoveredDevice{Name: name, Host: strings.TrimSpace(host)})
+			seen[host] = true
+			devices = append(devices, DiscoveredDevice{Name: name, Host: host})
 		}
 	}
 	return devices

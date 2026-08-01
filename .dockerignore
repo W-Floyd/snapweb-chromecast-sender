@@ -12,6 +12,11 @@ chromecast-sender
 # runtime image has no business carrying them.
 scripts/test_*.py
 
+# The Go tests. `COPY *.go .` takes them too, and `go build` ignores them — so
+# their only effect was to invalidate the build layer, and with it the module
+# download and compile beneath it, every time a test changed.
+*_test.go
+
 # Local runtime state; must not be baked into the image.
 config
 

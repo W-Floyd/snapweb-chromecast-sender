@@ -295,9 +295,10 @@ cleared is `''` locally but absent on the wire.
 Discovery is two-stage — `catt scan` (mDNS) first, a TCP probe of port 8008 as
 fallback — and streams progress over SSE. Four things to know:
 
-- **`catt scan` output is line-based**, `"<ip> - <name> - <mfr> <model>"`, not the
-  labelled `Name:` / `Host:` form. `parseCattScan` handles both; a wrong guess here
-  silently returns zero devices and falls through to the slow TCP path.
+- **`catt scan` output is line-based**, `"<ip> - <name> - <mfr> <model>"`. A wrong
+  guess at this format silently returns zero devices and falls through to the slow
+  TCP path — which is exactly what a labelled `Name:` / `Host:` parser, written on a
+  guess and kept for years after the real format was added, did nothing to prevent.
 - **Auto-detection deliberately skips interfaces.** `localSubnets` filters container
   bridges, `veth` pairs and VPN tunnels (`virtualIfacePrefixes`) — a Docker host has one
   bridge per compose network, and unfiltered it probed ~2800 hosts across eleven subnets

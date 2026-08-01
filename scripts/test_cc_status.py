@@ -124,13 +124,10 @@ _UNSET = object()
 class FakeStatus:
     """The subset of pychromecast's CastStatus that the helper reads."""
 
-    def __init__(self, app_id=None, display_name=None, is_stand_by=None,
-                 volume_level=None, volume_muted=None):
+    def __init__(self, app_id=None, display_name=None, is_stand_by=None):
         self.app_id = app_id
         self.display_name = display_name
         self.is_stand_by = is_stand_by
-        self.volume_level = volume_level
-        self.volume_muted = volume_muted
 
 
 class FakeCast:
@@ -228,18 +225,17 @@ class MainTest(unittest.TestCase):
 
     def test_the_status_payload_carries_what_the_go_side_reads(self):
         # The success path, with pychromecast stood in for: it is the only path
-        # that produces a status at all, and none of it — the idle rule, the
-        # rounding, the caps — was reachable without a device.
+        # that produces a status at all, and neither the idle rule nor the caps was
+        # reachable without a device.
         cast = self.run_with_status(app_id="84912283", display_name="DashCast",
-                                    is_stand_by=False, volume_level=0.4567,
-                                    volume_muted=False)
+                                    is_stand_by=False)
         payload = json.loads(self.stdout.getvalue())
+        # Exactly the three fields the Go side reads, and no more: anything else in
+        # here is computed on every poll of every device and looked at by nobody.
         self.assertEqual(payload, {
             "app_id": "84912283",
             "display_name": "DashCast",
             "is_idle": False,
-            "volume_level": 0.46,
-            "volume_muted": False,
         })
         # No "error" key at all: an empty one would read as success on the Go
         # side, and a present-but-empty one is the same thing.
@@ -255,16 +251,6 @@ class MainTest(unittest.TestCase):
         # left to end the process and it does so with no payload on the pipe.
         self.assertEqual(cast.wait_timeouts, [cc_status.CONNECT_TIMEOUT])
 
-    def test_an_unset_volume_is_reported_as_null_not_rounded(self):
-        # volume_level is None until the first status update lands, and round()
-        # would raise inside the success path.
-        self.run_with_status(app_id="84912283", display_name="DashCast",
-                             is_stand_by=False, volume_level=None,
-                             volume_muted=None)
-        payload = json.loads(self.stdout.getvalue())
-        self.assertIsNone(payload["volume_level"])
-        self.assertFalse(payload["is_idle"])
-
     def test_both_device_supplied_strings_are_bounded(self):
         # The reader keeps only the first 64KB of stdout and a *truncated* JSON
         # object does not parse at all, so one unbounded field takes the whole
@@ -273,7 +259,7 @@ class MainTest(unittest.TestCase):
         # casts run under. Nothing in the cast protocol bounds either.
         long_id = "A" * (cc_status.MAX_MESSAGE * 40)
         self.run_with_status(app_id=long_id, display_name="B" * (cc_status.MAX_MESSAGE * 40),
-                             is_stand_by=False, volume_level=1.0, volume_muted=False)
+                             is_stand_by=False)
         raw = self.stdout.getvalue()
         payload = json.loads(raw)  # must still parse, which is the whole point
         self.assertLess(len(raw), 64 << 10)
@@ -290,7 +276,7 @@ class MainTest(unittest.TestCase):
         # The Go side only offers a *playing* device's app id to its learner, so
         # this flag is what keeps the screensaver from becoming our dashboard.
         self.run_with_status(app_id=cc_status.BACKDROP_APP_ID, display_name="Backdrop",
-                             is_stand_by=False, volume_level=0.5, volume_muted=False)
+                             is_stand_by=False)
         self.assertTrue(json.loads(self.stdout.getvalue())["is_idle"])
 
     def test_a_device_that_never_reports_a_status_says_so(self):

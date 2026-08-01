@@ -139,19 +139,10 @@ def main():
         # is_idle is decided on the raw app_id, before the clip: a value long
         # enough to be cut is not one of the ids that rule means anything about,
         # and truncating first could only turn it into one by accident.
-        is_idle = device_is_idle(s.app_id, s.is_stand_by)
-        app_id = clip(s.app_id, MAX_MESSAGE)
-        display_name = clip(s.display_name, MAX_MESSAGE)
-
-        # volume_level/volume_muted are None until the first status update lands.
-        volume_level = round(s.volume_level, 2) if s.volume_level is not None else None
-
         emit({
-            "app_id": app_id,
-            "display_name": display_name,
-            "is_idle": is_idle,
-            "volume_level": volume_level,
-            "volume_muted": s.volume_muted,
+            "app_id": clip(s.app_id, MAX_MESSAGE),
+            "display_name": clip(s.display_name, MAX_MESSAGE),
+            "is_idle": device_is_idle(s.app_id, s.is_stand_by),
         })
 
     except SystemExit:

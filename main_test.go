@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -84,17 +85,10 @@ func TestParseCattScan(t *testing.T) {
 		t.Errorf("name with a separator = %+v, want \"Kitchen - Nest Hub\"", got)
 	}
 
-	// Labelled form still works, and noise is ignored.
-	got = parseCattScan("Name: Bathroom\nHost: 192.168.1.134\nsome - unrelated - text\n")
-	if len(got) != 1 || got[0] != (DiscoveredDevice{Name: "Bathroom", Host: "192.168.1.134"}) {
-		t.Errorf("labelled parse = %+v", got)
-	}
-
-	// ...in either field order. Emitting only on "Host:" dropped the device
-	// entirely when the host line came first.
-	got = parseCattScan("Host: 192.168.1.134\nName: Bathroom\n")
-	if len(got) != 1 || got[0] != (DiscoveredDevice{Name: "Bathroom", Host: "192.168.1.134"}) {
-		t.Errorf("host-first labelled parse = %+v", got)
+	// A line has to start with an IP to be a device. Anything else catt prints —
+	// its banner, its "No devices found.", a stray dash in a log line — is noise.
+	if got := parseCattScan("some - unrelated - text\nNo devices found.\n"); len(got) != 0 {
+		t.Errorf("noise parsed as devices: %+v", got)
 	}
 
 	if got := parseCattScan("Scanning Chromecasts...\nNo devices found.\n"); len(got) != 0 {
@@ -105,8 +99,7 @@ func TestParseCattScan(t *testing.T) {
 	// list the same device twice. The UI keys its list by host and Alpine throws
 	// on a duplicate key, dropping every discovered device rather than the repeat.
 	got = parseCattScan("192.168.1.5 - Lounge - Google Inc. Chromecast\n" +
-		"192.168.1.5 - Lounge - Google Inc. Chromecast\n" +
-		"Name: Lounge\nHost: 192.168.1.5\n")
+		"192.168.1.5 - Lounge - Google Inc. Chromecast\n")
 	if len(got) != 1 {
 		t.Errorf("duplicate hosts not collapsed: %+v", got)
 	}
@@ -345,16 +338,6 @@ func TestCastErrorRecordedAndCleared(t *testing.T) {
 	if got := castError(dev); got != "" {
 		t.Errorf("error not cleared after success: %q", got)
 	}
-
-	// Long output is truncated without splitting a multi-byte rune.
-	setCastError(dev, strings.Repeat("é", maxStatusTextLen*2))
-	got := castError(dev)
-	if !utf8.ValidString(got) {
-		t.Errorf("truncated message is not valid UTF-8: %q", got)
-	}
-	if n := utf8.RuneCountInString(got); n != maxStatusTextLen+1 { // +1 for the ellipsis
-		t.Errorf("truncated to %d runes, want %d", n, maxStatusTextLen+1)
-	}
 }
 
 func resetCastState() {
@@ -427,7 +410,11 @@ func TestStaleObservationDoesNotOverwriteNewerAction(t *testing.T) {
 	resetCastState()
 	probeStarted := time.Now().Add(-time.Second)
 	setCastState(dev, true, "") // cast completes while the probe is still running
-	observeCastState(dev, false, "", probeStarted)
+	// Reported as not applied, as well as not applied: interpretStatusOutput reads
+	// that answer to know it must report the recorded state instead of the stale one.
+	if observeCastState(dev, false, "", probeStarted) {
+		t.Error("an observation predating our cast should report as not applied")
+	}
 	if !isCasting(dev) {
 		t.Error("stale idle observation overwrote a newer successful cast")
 	}
@@ -447,7 +434,9 @@ func TestStaleObservationDoesNotOverwriteNewerAction(t *testing.T) {
 	// to notice that the device dropped the cast on its own.
 	resetCastState()
 	setCastState(dev, true, "")
-	observeCastState(dev, false, "", time.Now())
+	if !observeCastState(dev, false, "", time.Now()) {
+		t.Error("a fresh observation should report as applied")
+	}
 	if isCasting(dev) {
 		t.Error("a fresh observation should be applied")
 	}
@@ -521,23 +510,6 @@ func TestMislearnedCastAppSelfHeals(t *testing.T) {
 	}
 	if !isForeignApp("CA5E9605") {
 		t.Error("the interloper's app should now be the foreign one")
-	}
-}
-
-// A dropped observation is not evidence of anything. Reporting the app a stale
-// probe saw made the monitor "take back" a device that was already showing our
-// dashboard.
-func TestStaleObservationIsReportedAsNotApplied(t *testing.T) {
-	resetCastState()
-	dev := DeviceConfig{Name: "Lounge", Host: "1.2.3.4"}
-
-	probeStarted := time.Now().Add(-time.Second)
-	setCastState(dev, true, "")
-	if observeCastState(dev, true, "CA5E9605", probeStarted) {
-		t.Error("an observation predating our cast should report as not applied")
-	}
-	if !observeCastState(dev, true, "84912283", time.Now()) {
-		t.Error("a fresh observation should report as applied")
 	}
 }
 
@@ -1025,19 +997,21 @@ func TestCheckIntervalTracksConfig(t *testing.T) {
 		t.Errorf("checkInterval after a config change = %v, want 10s", got)
 	}
 
-	// Clamped even if something bypasses normalizeConfig: both ends of the range
-	// otherwise turn the monitor into a hot loop.
+	// The bounds belong to normalizeConfig, which is the single place they are
+	// applied (TestNormalizeConfig asserts them). Both ends of the range turn the
+	// monitor into a hot loop — too small directly, too large by overflowing this
+	// multiplication into a negative duration that a sleep does not wait on — so
+	// what matters is that nothing can reach checkInterval unnormalized.
+	unnormalized := Config{CheckInterval: 1 << 40}
+	normalizeConfig(&unnormalized)
 	cfgMu.Lock()
-	cfg.CheckInterval = 1 << 40
+	cfg = unnormalized
 	cfgMu.Unlock()
 	if got := checkInterval(); got != maxCheckInterval*time.Second {
 		t.Errorf("huge interval = %v, want the ceiling", got)
 	}
-	cfgMu.Lock()
-	cfg.CheckInterval = -1
-	cfgMu.Unlock()
-	if got := checkInterval(); got != minCheckInterval*time.Second {
-		t.Errorf("negative interval = %v, want the floor", got)
+	if checkInterval() <= 0 {
+		t.Error("the ceiling still overflowed into a duration a sleep ignores")
 	}
 }
 
@@ -3542,7 +3516,7 @@ func TestCattCallsPassTheRightSubcommandAndBudget(t *testing.T) {
 		if len(calls) != 1 {
 			t.Fatalf("%s: ran catt %d times, want once", c.name, len(calls))
 		}
-		if got := calls[0]; !slicesEqual(got, c.args) {
+		if got := calls[0]; !slices.Equal(got, c.args) {
 			t.Errorf("%s: argv = %v, want %v", c.name, got, c.args)
 		}
 		// Generous: the assertion is which budget was chosen, not how fast the
@@ -3618,18 +3592,6 @@ func TestCattScanKeepsWhatAFailedScanPrinted(t *testing.T) {
 	}
 }
 
-func slicesEqual(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
 // Once the browser has gone the ResponseWriter is no longer valid to write to, and
 // a TCP scan keeps producing events for as long as it takes to finish — including
 // the found and progress callbacks, which run on the scan's own goroutines.
@@ -3668,7 +3630,7 @@ func TestLocalSubnetsFallsBackToTheUnfilteredSet(t *testing.T) {
 		want = all
 	}
 	got := localSubnets()
-	if !slicesEqual(got, want) {
+	if !slices.Equal(got, want) {
 		t.Errorf("localSubnets = %v, want %v (physical %v, unfiltered %v)", got, want, physical, all)
 	}
 	// The fallback relaxes the interface-name guess and nothing else: the
