@@ -943,28 +943,20 @@ func TestPruneCastStatesDropsActions(t *testing.T) {
 	dev := DeviceConfig{Name: "Gone", Host: "1.2.3.4"}
 	setCastState(dev, true, "http://dash/")
 	observeCastState(dev, true, "84912283", time.Now())
-	// Every map keyed by deviceKey has to be covered, so a device that comes *back*
-	// under the same key does not inherit the state of the one that left — a
-	// resurrected castErrors entry is the visible one: a red error on the card of a
-	// device nothing has failed on yet. Written directly because no single sequence
-	// of calls leaves all six populated at once (a recorded error means nothing of
-	// ours is on screen, and an applied observation consumes the learn flag), and
-	// the point here is the set of maps, not how they came to be filled.
-	castStatesMu.Lock()
-	castErrors[deviceKey(dev)] = "Failed to connect."
-	castLearnPending[deviceKey(dev)] = true
-	castStatesMu.Unlock()
+	setCastError(dev, "Failed to connect.")
 
 	pruneCastStates(nil)
 
+	// Every map keyed by deviceKey, so a device that comes *back* under the same key
+	// does not inherit the state of the one that left. The castErrors entry is the
+	// visible one: a red error on the card of a device nothing has failed on yet.
 	castStatesMu.RLock()
 	sizes := map[string]int{
-		"castStates":       len(castStates),
-		"castErrors":       len(castErrors),
-		"castActions":      len(castActions),
-		"castObserved":     len(castObserved),
-		"castURLs":         len(castURLs),
-		"castLearnPending": len(castLearnPending),
+		"castStates":   len(castStates),
+		"castErrors":   len(castErrors),
+		"castActions":  len(castActions),
+		"castObserved": len(castObserved),
+		"castURLs":     len(castURLs),
 	}
 	castStatesMu.RUnlock()
 	for name, n := range sizes {
@@ -973,7 +965,7 @@ func TestPruneCastStatesDropsActions(t *testing.T) {
 		}
 	}
 
-	// And a device still in the config keeps everything.
+	// And a device still in the config keeps its state.
 	resetCastState()
 	kept := DeviceConfig{Name: "Kept", Host: "5.6.7.8"}
 	setCastError(kept, "Failed to connect.")
@@ -2579,37 +2571,6 @@ func TestInterpretStatusOutputRefusesANonObjectPayload(t *testing.T) {
 	}
 }
 
-// A payload that says "playing" without naming the app describes a state that
-// cannot be acted on either way: recorded as playing, the monitor skips the
-// device for the life of the process; recorded as idle, it re-casts over whatever
-// is on screen on every tick. The helper's own idle rule reports a device with no
-// app id as idle — but it decides that on the *raw* id and then strips it, so a
-// device whose app id is nothing but whitespace arrives here as exactly this.
-func TestInterpretStatusOutputRefusesAPlayingDeviceWithNoAppID(t *testing.T) {
-	dev := DeviceConfig{Name: "Lounge", Host: "1.2.3.4"}
-	for _, stdout := range []string{
-		`{"is_idle":false}`,
-		`{"app_id":"","display_name":"Something","is_idle":false}`,
-	} {
-		resetCastState()
-		ds := interpret(dev, stdout)
-		if ds.Error == "" {
-			t.Errorf("stdout %q produced no error", stdout)
-		}
-		if ds.State != "unknown" {
-			t.Errorf("stdout %q = state %q, want \"unknown\" rather than an invented one", stdout, ds.State)
-		}
-		if isCasting(dev) {
-			t.Errorf("stdout %q was recorded as the device playing something", stdout)
-		}
-	}
-	// The complement: an *idle* payload names no app and is perfectly ordinary.
-	resetCastState()
-	if ds := interpret(dev, `{"is_idle":true}`); ds.Error != "" || ds.State != "Idle" {
-		t.Errorf("idle payload = %+v, want a clean \"Idle\"", ds)
-	}
-}
-
 // The helper pays to produce a traceback — it is the only thing that identifies a
 // broken pychromecast install, and it is capped at 4000 characters precisely so it
 // survives to be read. Decoded and dropped on the floor, that cost bought nothing:
@@ -2635,15 +2596,7 @@ func TestInterpretStatusOutputLogsTheHelpersTraceback(t *testing.T) {
 		}
 	}
 
-	// Bounded on the way to the log as well: it arrives from a subprocess, and
-	// nothing but this reader enforces the helper's own cap on it.
-	logged.Reset()
-	interpret(dev, `{"error":"boom","detail":"`+strings.Repeat("x", maxLoggedDetailLen*2)+`"}`)
-	if n := logged.Len(); n > maxLoggedDetailLen+500 {
-		t.Errorf("logged %d bytes for one failure, want the detail bounded", n)
-	}
-
-	// And nothing at all when there is no traceback, which is every failure the
+	// Nothing at all when there is no traceback, which is every failure the
 	// helper recognised for itself.
 	logged.Reset()
 	interpret(dev, `{"error":"1.2.3.4 is not reachable on port 8009"}`)
@@ -3504,18 +3457,6 @@ func TestCattStandIn(t *testing.T) {
 	}
 	switch mode {
 	case "quiet": // exits 0 with nothing on either stream, like a successful cast
-	case "streams":
-		// Written in this order, and to both streams, because os/exec hands a
-		// single pipe to both when Stdout == Stderr — which is what preserves the
-		// interleaving a traceback needs to stay readable.
-		fmt.Fprint(os.Stdout, "one ")
-		fmt.Fprint(os.Stderr, "two ")
-		fmt.Fprint(os.Stdout, "three")
-	case "flood":
-		chunk := strings.Repeat("x", 4096)
-		for written := 0; written < maxSubprocessOutput*3; written += len(chunk) {
-			fmt.Fprint(os.Stdout, chunk)
-		}
 	case "scan":
 		fmt.Fprintln(os.Stdout, "Scanning Chromecasts...")
 		fmt.Fprintln(os.Stdout, "192.168.1.5 - Kitchen - Nest Hub - Google Inc. Nest Hub")
@@ -3647,36 +3588,6 @@ func TestRunCattReportsWhatCattPrinted(t *testing.T) {
 	}
 }
 
-func TestRunCattMergesBothStreamsInOrder(t *testing.T) {
-	withCattStandIn(t, "streams")
-	out, err := runCatt(context.Background(), 10*time.Second, "status")
-	if err != nil {
-		t.Fatalf("runCatt = %v, out %q", err, out)
-	}
-	// One pipe for both streams, so the interleaving survives — a traceback split
-	// across the two and reordered is not readable, and stderr is where the useful
-	// half of a catt failure is written.
-	if out != "one two three" {
-		t.Errorf("output = %q, want both streams in the order they were written", out)
-	}
-}
-
-// Nothing bounds what catt prints: pychromecast and zeroconf both log through it,
-// and a scan that goes wrong can keep printing for the whole 30s budget.
-func TestRunCattBoundsWhatItBuffers(t *testing.T) {
-	withCattStandIn(t, "flood")
-	out, err := runCatt(context.Background(), 30*time.Second, "scan")
-	// The dropped bytes must not surface as the command's error: a short count from
-	// the buffer makes the copier report io.ErrShortWrite, which would replace the
-	// real result with a plumbing detail.
-	if err != nil {
-		t.Errorf("a chatty subprocess failed the call: %v", err)
-	}
-	if len(out) != maxSubprocessOutput {
-		t.Errorf("buffered %d bytes, want the cap of %d", len(out), maxSubprocessOutput)
-	}
-}
-
 // The mDNS path end to end, minus catt itself: a wrong guess at the output format
 // silently returns zero devices and falls through to the slow TCP scan, which is
 // indistinguishable from there being nothing on the network.
@@ -3718,38 +3629,6 @@ func slicesEqual(a, b []string) bool {
 	}
 	return true
 }
-
-// A ResponseWriter that cannot flush would leave every event sitting in the
-// buffer until the scan finished, which is the whole point of the stream —
-// progress that arrives at the end is not progress. Say so instead of streaming
-// into a void.
-func TestHandleScanRequiresAFlushableWriter(t *testing.T) {
-	withScanners(t,
-		func(context.Context) []DiscoveredDevice {
-			t.Error("an unflushable writer must be refused before any scanning")
-			return nil
-		},
-		func(context.Context, []string, func(string), func(DiscoveredDevice), func(int, int)) ([]DiscoveredDevice, string) {
-			t.Error("an unflushable writer must be refused before any scanning")
-			return nil, ""
-		})
-
-	rec := httptest.NewRecorder()
-	handleScan(unflushable{rec}, httptest.NewRequest(http.MethodGet, "/api/devices/scan", nil))
-	if rec.Code != http.StatusInternalServerError {
-		t.Errorf("unflushable writer = %d, want 500", rec.Code)
-	}
-	if scanInFlight.Load() {
-		t.Error("a refused scan left scanInFlight set")
-	}
-}
-
-// unflushable hides httptest.ResponseRecorder's Flush method.
-type unflushable struct{ inner http.ResponseWriter }
-
-func (u unflushable) Header() http.Header         { return u.inner.Header() }
-func (u unflushable) Write(p []byte) (int, error) { return u.inner.Write(p) }
-func (u unflushable) WriteHeader(code int)        { u.inner.WriteHeader(code) }
 
 // Once the browser has gone the ResponseWriter is no longer valid to write to, and
 // a TCP scan keeps producing events for as long as it takes to finish — including

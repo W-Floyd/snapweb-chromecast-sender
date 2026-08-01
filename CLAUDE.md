@@ -73,78 +73,44 @@ Neither is installed outside the Docker image, so `/api/devices/*` degrades to e
 rows when running `go run` on a dev machine. That's expected. **No test may shell out
 to `catt` or to the status helper** — keep it that way.
 
-The way the *rest* of the logic is still tested is a set of function variables —
-`probeDevice`, `castSite`, `stopCast`, `mdnsScan`, `tcpScanner`, `cattCmd`,
-`detectSubnets` — that the tests substitute (`withFakeCatt`, `withProbe`,
-`withScanners`, `withCattStandIn`, `withDetectedSubnets`). They exist because
-`monitorDevices` is the only code that both probes a device and decides whether to cast
-to it, so none of its ordering could be exercised while it shelled out directly, and the
-same went for the goroutines in `/api/devices/cast` and `/stop`, which are where a
-failure *becomes* a `castErrors` entry. A new subprocess call in that path belongs behind
-one of them, and a new decision in the loop belongs in a test that drives it — the fake
-probe deliberately applies the observation the real one does, because the loop reads
-`castStates`, not the returned struct.
+The rest of the logic is still tested through function variables the tests substitute:
 
-`mdnsScan` and `tcpScanner` are `handleScan`'s pair of stages. An mDNS hit ends the
-stream early, so that whole branch — the `found` events, the count, the TCP fallback it
-skips — was unreachable in a test that may not run `catt`; and the fallback with no
-explicit subnet probes 254 hosts of whatever `localSubnets` finds, which is the LAN of
-the machine running the tests. `tcpScan` itself is exercised for real, against loopback:
-the `chromecastSetupPort` var is a variable only so a test can put a stand-in server on
-that port and reach the confirm step — dial, fetch `/setup/eureka_info`, decode, require
-a name — which decides whether a responding host is reported at all and otherwise needs
-a Chromecast on the test machine. `detectSubnets` is the auto-detection inside `tcpScan`,
-for the same reason one layer down: both halves of that fallback — the give-up message a
-host with no private address gets, and a detected subnet reaching the probe at all —
-otherwise depended on what the tester's machine happened to be plugged into.
+| Seam | Substituted by | Because |
+|---|---|---|
+| `probeDevice`, `castSite`, `stopCast` | `withProbe`, `withFakeCatt` | `monitorDevices` is the only code that both probes a device and decides whether to cast to it, and the `/cast` and `/stop` goroutines are where a failure *becomes* a `castErrors` entry |
+| `mdnsScan`, `tcpScanner` | `withScanners` | an mDNS hit ends the SSE stream early, and the no-subnet fallback probes 254 hosts of the tester's own LAN |
+| `cattCmd` | `withCattStandIn` | `runCatt`'s own decisions, and the argv each catt call is built with |
+| `detectSubnets` | `withDetectedSubnets` | same as `tcpScanner`, one layer down: which subnet auto-detection hands to the probe, and the give-up message when it finds none |
+| `chromecastSetupPort` | (set directly) | the confirm step — dial, fetch `/setup/eureka_info`, decode, require a name — otherwise needs a real Chromecast |
 
-`cattCmd` builds the subprocess `runCatt` runs, and the tests point it at this test
-binary re-invoked to run `TestCattStandIn` (its mode arrives in the environment, because
-catt's own `-d` would reach the child's flag parser as an unknown flag). That is not a
-way of running catt: it is the only way to assert what `runCatt` itself decides — the
-deadline it *names*, so a killed subprocess does not reach the card as "signal: killed";
-the single buffer both streams share, which is what keeps a traceback in order; the cap
-on what it buffers, which must not surface as `io.ErrShortWrite` in place of the real
-result — and, through the argv the seam records, the subcommand and timeout budget each
-of `cattStatus`, `castSite`, `stopCast` and `cattScan` is given. A typo in one of those
-subcommand names is otherwise invisible until a device fails to cast, with catt's usage
-message on the card as the only clue.
+A new subprocess call belongs behind one of these, and a new decision in the loop
+belongs in a test that drives it. The fake probe deliberately *applies* the observation
+the real one does, because the loop reads `castStates`, not the returned struct.
 
-`interpretStatusOutput` is the same split one layer down: `getPychromecastStatus` is now
+`cattCmd` points at this test binary re-invoked to run `TestCattStandIn` (its mode
+arrives in the environment, because catt's own `-d` would reach the child's flag parser
+as an unknown flag). That is not a way of running catt: it is how the deadline `runCatt`
+*names* — so a killed subprocess does not reach the card as "signal: killed" — and the
+subcommand and timeout budget of `cattStatus`, `castSite`, `stopCast` and `cattScan` get
+asserted. A typo in one of those subcommand names is otherwise invisible until a device
+fails to cast.
+
+`interpretStatusOutput` is the same split one layer down: `getPychromecastStatus` is
 only the subprocess plumbing, and everything that *reads* the result — the diagnostic
-precedence, the stale-poll fallback, the app-id learner, the bounding of
-device-supplied text — is a pure-ish function a test can call directly. It decodes the
-payload into a **pointer** and refuses `nil`, exactly as `POST /api/config` does with its
-body and for the same reason: a bare `null` on stdout decodes into a value without
-error and leaves an empty `error` and `is_idle: false`, which reads as "the device is
-playing something" — a state nobody reported, written into `castStates` and rendered on
-the card.
-
-It refuses a second payload for the same reason: `is_idle: false` with no `app_id`. The
-app id is the whole means of telling our own dashboard from somebody else's, and
-`device_is_idle` in `cc_status.py` already reports a device with no app id as *idle* — so
-a payload claiming otherwise describes a state neither answer fits. Recorded as playing
-it matches the "playing, not foreign, not stale" skip on every tick and the device is
-never touched again; recorded as idle it re-casts over whatever is on screen every tick.
-This is not only a guard against the two sides drifting: the helper decides idleness on
-the **raw** app id and then strips it, so a device reporting an app id of nothing but
-whitespace arrives here as exactly that payload.
-
-The helper's `detail` — the traceback, which it caps at 4000 characters precisely so it
-survives to be read — goes to the **log**, not into the `DeviceStatus`. It is the only
-thing that identifies a broken pychromecast install, and `error` already carries the
-one-line summary that belongs on a card sized for one line. Decoded and dropped, which is
-what happened before, it was produced at that cost and read by nobody.
-
-The layered timeouts are not asserted by hand: `TestStatusQueryTimeoutOutlastsTheScriptWatchdog`
-reads `OVERALL_TIMEOUT` and friends straight out of `cc_status.py` (no interpreter
-needed) and checks the ordering, because a comment asking the next reader to go and
-check the other language is exactly what does not happen.
+precedence, the stale-poll fallback, the app-id learner, the bounding of device-supplied
+text — is a pure-ish function a test can call directly. It decodes the payload into a
+**pointer** and refuses `nil`, exactly as `POST /api/config` does with its body and for
+the same reason: a bare `null` decodes into a value without error and leaves an empty
+`error` and `is_idle: false`, which reads as "the device is playing something" — a state
+nobody reported, written into `castStates` and rendered on the card.
 
 Timeout budgets are layered and must stay ordered: `PROBE_TIMEOUT` < `CONNECT_TIMEOUT`
 < `OVERALL_TIMEOUT` (12s watchdog) < the Go side's 15s context in
-`getPychromecastStatus`. If you change one, check the others — a subprocess killed by
-Go exits with no output, which is the failure mode the watchdog exists to avoid.
+`getPychromecastStatus`. A subprocess killed by Go exits with no output, which is the
+failure mode the watchdog exists to avoid. The ordering is asserted rather than
+commented — `TestStatusQueryTimeoutOutlastsTheScriptWatchdog` reads the constants
+straight out of `cc_status.py`, no interpreter needed, because a comment asking the next
+reader to go and check the other language is exactly what does not happen.
 
 The plain-TCP `reachable()` check before importing pychromecast is not redundant.
 `get_chromecast_from_host` makes a blocking HTTP call to determine cast type that takes
@@ -170,13 +136,15 @@ Two config rows can nonetheless *share* one `deviceKey` — the same IP typed tw
 an IP filled into a row another row already carries — and they then share every map
 above, `castURLs` included. With a different URL on each row the monitor cast row
 one's page, judged it stale against row two's, cast that, and repeated the pair on
-every tick: an always-on dashboard restarting itself forever. `autoCastTargets` acts
-on the first such row only, and `duplicateDeviceKeys` feeds `configWarning` so the
-others say why they are inert.
+every tick: an always-on dashboard restarting itself forever. `autoCastTargets` acts on
+the first such row with auto-cast enabled and no other, and `duplicateDeviceKeys` feeds
+`configWarning` so the rest say why they are inert.
 
-`autoCastTargets` is also where every skip `monitorDevices` makes *before* touching
-the network lives. Keeping it pure keeps those skips assertable one row at a time;
-the rest of the loop is covered through the subprocess seams described above.
+`autoCastTargets` is also where every skip `monitorDevices` makes *before* touching the
+network lives. Keeping it pure keeps those skips assertable one row at a time; the rest
+of the loop is covered through the subprocess seams described above. A skip is invisible
+from the UI — the card reads a plain "Idle", identical to a device auto-cast is happily
+managing — which is what `configWarning` below exists to fix.
 
 Concretely (traced through catt 0.13.1, `cli.py` → `util.echo_status` →
 `controllers.cast_info`): `catt status` describes the *media* session, and a web page
@@ -188,33 +156,32 @@ guessing "idle" would re-cast every tick and restart the dashboard forever. Don'
 on that path; an `auto_cast` device with no IP gets a `Warning` from `configWarning`
 instead, because the monitor genuinely cannot watch it.
 
-`configWarning` is where *every* silent `continue` in `monitorDevices` gets explained.
-A skipped device is invisible — its card reads a plain "Idle" and looks identical to
-one auto-cast is happily managing — so a new skip condition needs a warning alongside
-it. It takes the *effective* URL (`effectiveURL`) and a `duplicate` flag, not just the
-device, because "no URL and no default" and "two rows for one device" are properties
-of the device *and* its context, not of the device alone. Warnings, not `castErrors`:
-a standing config problem recorded as a fresh cast failure every tick would keep
-bumping `castActions` and suppress every status observation of that device for good.
+`configWarning` is where every one of those skips gets explained, so a new skip
+condition needs a warning alongside it. It takes the *effective* URL (`effectiveURL`)
+and a `duplicate` flag, not just the device, because "no URL and no default" and "two
+rows for one device" are properties of the device *and* its context. Warnings, not
+`castErrors`: a standing config problem recorded as a fresh cast failure every tick
+would keep bumping `castActions` and suppress every status observation of that device
+for good.
 
-Order matters inside it. For an `auto_cast` row the two URL problems are reported
-*ahead* of the duplicate advisory, because they stop the device being cast at all
-whereas the duplicate note only says which row does the casting — and
-`autoCastTargets` claims a `deviceKey` for the first matching row *before* it looks at
-that row's URL, so a duplicated pair whose first row has the unusable URL is never
-cast and leading with the duplicate advisory was actively misleading. A row with
-auto-cast off skips the URL gates entirely, so it keeps the duplicate advisory — but a
-*different* one (`duplicateEntryWarningNoAuto`): naming the row that gets cast is a
-consequence that cannot apply to a row with the box unticked, and reads as though
-ticking it would be pointless. What is left is the cost that applies either way, which
-is that both rows show the same state and the same cast error.
+Order and wording matter inside it, and both hinge on the same fact:
+`autoCastTargets` claims a `deviceKey` for the first row *with auto-cast enabled*,
+before it looks at that row's URL.
 
-The advisory says "only the first **with auto-cast enabled**", not "only the first",
-because `autoCastTargets` skips a row with the box unticked *before* it claims the
-`deviceKey`: tick it on the second row of a pair and not the first, and the second row
-is the one being cast — and it is the row the advisory is rendered on. Naming the first
-row there told the reader that the row in front of them was inert when it was in fact
-the only one doing anything.
+- The two URL problems are reported *ahead* of the duplicate advisory, because they
+  stop the device being cast at all whereas the duplicate note only says which row does
+  the casting. A duplicated pair whose first row has the unusable URL is never cast, so
+  leading with the duplicate advisory hid the one problem the user could fix.
+- The advisory says "only the first **with auto-cast enabled**", not "only the first".
+  Tick the box on the second row of a pair and not the first, and the second row is the
+  one being cast — and it is the row the advisory is rendered on, so naming the first
+  told the reader that the row in front of them was inert when it was the only one
+  doing anything.
+- A row with auto-cast off skips the URL gates entirely and keeps the advisory, but a
+  *different* one (`duplicateEntryWarningNoAuto`): naming the row that gets cast is a
+  consequence that cannot apply to a row with the box unticked, and reads as though
+  ticking it would be pointless. What is left is the cost that applies either way —
+  both rows show the same state and the same cast error.
 
 The implication runs one way only — a warned device may still be cast to (one with no
 IP is cast blind; the first row of a duplicated pair is the row that gets cast) — so
@@ -222,66 +189,60 @@ IP is cast blind; the first row of a duplicated pair is the row that gets cast) 
 
 The full set of labels `catt status` can print is `Title:`, `Time:`, `Remaining time:`,
 `State:`, `Volume:` and `Volume muted:` — so `cattStatusState` parses `State: ` and
-nothing else (and ignores it when empty: a bare `State: ` blanked the card's only
-state line, which reads as a UI fault rather than as the device saying nothing). It once also looked for a `Content: ` line, which catt has never emitted;
-that fed a `DeviceStatus.URL` no code ever read. `State: ` itself only appears when the
-media session reports a non-image `content_type`, which our own `cast_site` never does
-and a media app may, so it is narrow but not dead — keep it, and don't add parsing for
-labels without checking that list first. Parse it with `splitLines`, not
-`bufio.Scanner`: the scanner's default token limit is 64KB, which is exactly
-`maxSubprocessOutput`, so a single unterminated line made the first `Scan` fail
-with `ErrTooLong` — an error both callers discard — and the parser saw nothing
-at all.
+nothing else, and ignores it when empty (a bare `State: ` blanked the card's only state
+line, which reads as a UI fault rather than as the device saying nothing). It once also
+parsed a `Content: ` line, which catt has never emitted, feeding a `DeviceStatus.URL` no
+code ever read. `State: ` appears only when the media session reports a non-image
+`content_type`, which our own `cast_site` never does and a media app may — narrow but
+not dead. Don't add parsing for labels without checking that list first. Parse with
+`splitLines`, not `bufio.Scanner`: the scanner's default token limit is 64KB, exactly
+`maxSubprocessOutput`, so a single unterminated line made the first `Scan` fail with
+`ErrTooLong` — an error both callers discard — and the parser saw nothing at all.
 
-`isCasting` means "playing *something*", not "playing ours" — a person casting
-Netflix sets it too. Telling the two apart needs the `app_id` the status helper
-reports, and `learnedCastApp` picks that up from the first poll after a cast we
-initiated rather than hardcoding DashCast's id. Don't be tempted to hardcode it:
-if the constant is wrong the monitor reads its own dashboard as a foreign app and
-re-casts it on every tick, so an app we cannot place deliberately reports *not*
-foreign. A device's `takeover` flag is what then lets auto-cast reclaim it.
+The five maps under `castStatesMu`, and the regression each one exists for:
 
-A status poll takes seconds, so one that started before a cast can land after it.
-`castActions` timestamps our own casts and `observeCastState` drops any
-observation older than that — without it the poll's stale view overwrote the
-newer truth, which both erased fresh cast errors and re-cast devices that were
-already playing. `castURLs` is the other half of the skip: `isCasting` only says *something* of
-ours is up, not that it is the *current* page, so a device already showing the
-old URL was skipped forever and editing `default_url` looked like a no-op. Only
-a cast of ours writes it — a device merely *observed* playing gets no entry, so
-one already up when the process starts is left alone rather than restarted.
+| Map | Holds | Without it |
+|---|---|---|
+| `castStates` | is the device playing *something* — not necessarily ours | — |
+| `castURLs` | the page **we** put on screen, when we know it | `isCasting` says something of ours is up, not that it is the *current* page, so a device showing the old URL was skipped forever and editing `default_url` looked like a no-op |
+| `castErrors` | why our last cast or stop failed | a cast that failed over a page still on screen is never retried (see below) |
+| `castActions` | when we last cast or stopped | a poll that started before the cast lands after it and overwrites the newer truth — erasing fresh errors, re-casting devices already playing |
+| `castObserved` | when the newest applied poll began | `/api/devices/status` and the monitor probe independently, so the poll that started earlier can finish later and republish the older view |
 
-A live `castErrors` entry is the *third* reason to cast, alongside "idle" and
-"stale URL", and it is the one that covers a cast that failed over a page still on
-screen. That is the normal shape of the failure for an always-on dashboard:
-`cast_site` fails, the page it was replacing is still up, and the next probe duly
-reports the device as playing. `setCastError` has already dropped the `castURLs`
-entry, so nothing says the page is stale, and "playing, not foreign, not stale" is
-the skip — the device was then never touched again for the life of the process.
-Which is also why an observation *never* clears a `castErrors` entry, playing or
-idle: "playing something" is not evidence that our cast worked, and clearing there
-left the monitor unable to tell the page it asked for from the page it failed to
-replace. Only `setCastState` clears one, so the reason stands until an action of
-ours actually succeeds. The cost is that a device nothing is auto-casting keeps a
-red error on its card next to a healthy "Playing" until someone casts to it
-again — which is the accurate report of what happened, and much the cheaper of the
-two failure modes.
+Only a cast of *ours* writes `castURLs`: a device merely observed playing gets no
+entry, so one already up when the process starts is left alone rather than restarted.
 
-`castObserved` does the same for polls against *each other*:
-`/api/devices/status` and the monitor probe the same device independently, so
-whichever started earlier can easily finish later. Any new timestamped state
-belongs in `pruneCastStates` and in `resetCastState` in the tests.
+A live `castErrors` entry is the *third* reason to cast, alongside "idle" and "stale
+URL", and it covers the normal failure shape for an always-on dashboard: `cast_site`
+fails, the page it was replacing is still up, the next probe reports the device as
+playing, and `setCastError` has already dropped the `castURLs` entry — so "playing, not
+foreign, not stale" skipped the device for the life of the process. Which is also why an
+observation *never* clears an error, playing or idle: "playing something" is not evidence
+that our cast worked. Only `setCastState` clears one. The cost is that a device nothing
+is auto-casting keeps a red error beside a healthy "Playing" until someone casts to it
+again — the accurate report of what happened, and much the cheaper of the two failure
+modes.
 
-**The monitor does not just sleep the interval.** `monitorLoop` waits on a timer
-that `POST /api/config` interrupts through `configChanged`, and re-reads
-`checkInterval()` each time round through `remainingWait`. The interval ceiling is a
-day, so a plain sleep on the value read at the top of the cycle applied a *lowered*
-interval up to 24h late and the save looked like it had done nothing. The deadline
-stays measured from the start of the wait, so a burst of saves can only shorten it,
-never postpone the next poll. `remainingWait` and `awaitNextTick` are separate
-functions so all of that is a direct assertion rather than a test that has to wait out
-a real interval — `monitorLoop` itself cannot be called from a test at all, since it
-never returns.
+`isCasting` means "playing *something*" — a person casting Netflix sets it too. Telling
+the two apart needs the `app_id` the status helper reports, and `learnedCastApp` picks
+that up from the first poll after a cast we initiated rather than hardcoding DashCast's
+id. Don't be tempted to hardcode it: if the constant is wrong the monitor reads its own
+dashboard as a foreign app and re-casts it every tick, so an app we cannot place
+deliberately reports *not* foreign. A device's `takeover` flag is what then lets
+auto-cast reclaim it.
+
+Any new timestamped state belongs in `pruneCastStates` and in `resetCastState` in the
+tests.
+
+**The monitor does not just sleep the interval.** `monitorLoop` waits on a timer that
+`POST /api/config` interrupts through `configChanged`, and re-reads `checkInterval()`
+each time round through `remainingWait`. The ceiling is a day, so sleeping on the value
+read at the top of the cycle applied a *lowered* interval up to 24h late and the save
+looked like it had done nothing. The deadline stays measured from the start of the wait,
+so a burst of saves can only shorten it, never postpone the next poll. `remainingWait`
+and `awaitNextTick` are separate functions so that is a direct assertion rather than a
+test that waits out a real interval — `monitorLoop` cannot be called from a test at all,
+since it never returns.
 
 **A cast is reported before it happens.** `/api/devices/cast` and `/stop` answer
 immediately and run `catt` in a goroutine, so failures can't ride on the HTTP response.
@@ -316,6 +277,10 @@ diagnosis. Every device-supplied string in that payload is clipped for that reas
 `app_id` included even though nothing renders it: it is compared against, and stored
 as, the id our own casts run under. `device_is_idle` is applied to the *raw* id, before
 the clip, so truncating cannot turn one id into another by accident.
+
+`detail` is the exception to "nothing renders it": it goes to the **log**, not into the
+`DeviceStatus`. It is the only thing that identifies a broken pychromecast install, and
+`error` already carries the one-line summary that fits on a card.
 
 `DeviceStatus` carries `Host` as well as `Name` so the UI can tell whether its local
 device list still lines up with the server's. Pairing is by index; the identity check

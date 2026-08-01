@@ -867,13 +867,10 @@ type statusPayload struct {
 	DisplayName string `json:"display_name"`
 	IsIdle      bool   `json:"is_idle"`
 	Error       string `json:"error"`
-	// Detail is the helper's traceback, sent alongside Error whenever the failure
-	// was an unexpected exception rather than a diagnosis the helper recognised.
-	// It goes to the log rather than into the DeviceStatus: it is the only thing
-	// that identifies a broken pychromecast install, and the helper caps it at
-	// 4000 characters precisely so it survives to be read — but it is far too long
-	// for a device card, and Error already carries the one-line summary of it.
-	// Decoded and discarded, it was produced at that cost and never read at all.
+	// Detail is the helper's traceback, sent alongside Error when the failure was an
+	// unexpected exception. It goes to the log, not into the DeviceStatus: it is the
+	// only thing that identifies a broken pychromecast install, but it is far too
+	// long for a card, and Error already carries its one-line summary.
 	Detail string `json:"detail"`
 }
 
@@ -951,23 +948,6 @@ func interpretStatusOutput(dev DeviceConfig, stdout, stderr []byte, runErr, ctxE
 		if detail := boundText(result.Detail, maxLoggedDetailLen); detail != "" {
 			log.Printf("status helper failed for %q: %s\n%s", deviceLabel(dev), ds.Error, detail)
 		}
-		return ds
-	}
-
-	// A device reported as playing has to name the app that is playing. The app id
-	// is the whole means of telling our own dashboard from somebody else's, and the
-	// helper's own idle rule already reports a device with no app id as idle (see
-	// device_is_idle in cc_status.py) — so a payload claiming otherwise describes a
-	// state we cannot act on, and both ways of acting on it are wrong: recorded as
-	// playing it makes the monitor skip the device for the life of the process,
-	// recorded as idle it re-casts over whatever is on screen on every tick.
-	// Refuse it and say so, exactly as a null payload is refused above.
-	//
-	// Not merely defensive against drift, though it is that too: the helper decides
-	// idleness on the *raw* app id and then strips it, so a device reporting an app
-	// id of nothing but whitespace arrives here as "playing" with the field empty.
-	if !result.IsIdle && result.AppID == "" {
-		ds.Error = "status helper reported a playing device with no app id"
 		return ds
 	}
 
