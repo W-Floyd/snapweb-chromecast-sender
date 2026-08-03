@@ -77,7 +77,7 @@ The rest of the logic is still tested through function variables the tests subst
 
 | Seam | Substituted by | Because |
 |---|---|---|
-| `probeDevice`, `castSite`, `stopCast` | `withProbe`, `withFakeCatt` | `monitorDevices` is the only code that both probes a device and decides whether to cast to it, and the `/cast` and `/stop` goroutines are where a failure *becomes* a `castErrors` entry |
+| `probeDevice`, `castSite`, `stopCast` | `withProbe`, `withFakeCatt` | `monitorDevices` is the only code that both probes a device and decides whether to cast to it, and the `/cast` and `/stop` goroutines are where a failure *becomes* a recorded cast error |
 | `mdnsScan`, `tcpScanner` | `withScanners` | an mDNS hit ends the SSE stream early, and the no-subnet fallback probes 254 hosts of the tester's own LAN |
 | `cattCmd` | `withCattStandIn` | `runCatt`'s own decisions, and the argv each catt call is built with |
 | `detectSubnets` | `withDetectedSubnets` | same as `tcpScanner`, one layer down: which subnet auto-detection hands to the probe, and the give-up message when it finds none |
@@ -134,7 +134,7 @@ tick) and pruned on config save. Never key new state by name alone.
 
 Two config rows can nonetheless *share* one `deviceKey` — the same IP typed twice, or
 an IP filled into a row another row already carries — and they then share every map
-above, `castURLs` included. With a different URL on each row the monitor cast row
+above, the recorded URL included. With a different URL on each row the monitor cast row
 one's page, judged it stale against row two's, cast that, and repeated the pair on
 every tick: an always-on dashboard restarting itself forever. `autoCastTargets` acts on
 the first such row with auto-cast enabled and no other, and `duplicateDeviceKeys` feeds
@@ -160,8 +160,8 @@ instead, because the monitor genuinely cannot watch it.
 condition needs a warning alongside it. It takes the *effective* URL (`effectiveURL`)
 and a `duplicate` flag, not just the device, because "no URL and no default" and "two
 rows for one device" are properties of the device *and* its context. Warnings, not
-`castErrors`: a standing config problem recorded as a fresh cast failure every tick
-would keep bumping `castActions` and suppress every status observation of that device
+a recorded cast error: a standing config problem recorded as a fresh failure every
+tick would keep bumping `actedAt` and suppress every status observation of that device
 for good.
 
 Order and wording matter inside it, and both hinge on the same fact:
@@ -199,24 +199,31 @@ not dead. Don't add parsing for labels without checking that list first. Parse w
 `maxSubprocessOutput`, so a single unterminated line made the first `Scan` fail with
 `ErrTooLong` — an error both callers discard — and the parser saw nothing at all.
 
-The five maps under `castStatesMu`, and the regression each one exists for:
+`castStates` is one `map[string]castState` under `castStatesMu`. It was six parallel
+maps sharing that key and mutex, which meant `pruneCastStates` had to name each of
+them — and a map added to the set and forgotten there leaves state behind for whatever
+device next takes the key. The fields, and the regression each one exists for:
 
-| Map | Holds | Without it |
+| Field | Holds | Without it |
 |---|---|---|
-| `castStates` | is the device playing *something* — not necessarily ours | — |
-| `castURLs` | the page **we** put on screen, when we know it | `isCasting` says something of ours is up, not that it is the *current* page, so a device showing the old URL was skipped forever and editing `default_url` looked like a no-op |
-| `castErrors` | why our last cast or stop failed | a cast that failed over a page still on screen is never retried (see below) |
-| `castActions` | when we last cast or stopped | a poll that started before the cast lands after it and overwrites the newer truth — erasing fresh errors, re-casting devices already playing |
-| `castObserved` | when the newest applied poll began | `/api/devices/status` and the monitor probe independently, so the poll that started earlier can finish later and republish the older view |
+| `playing` | is the device showing *something* — not necessarily ours | — |
+| `url` | the page **we** put on screen, empty when we did not | `isCasting` says something of ours is up, not that it is the *current* page, so a device showing the old URL was skipped forever and editing `default_url` looked like a no-op |
+| `err` | why our last cast or stop failed | a cast that failed over a page still on screen is never retried (see below) |
+| `actedAt` | when we last cast or stopped | a poll that started before the cast lands after it and overwrites the newer truth — erasing fresh errors, re-casting devices already playing |
+| `observedAt` | when the newest applied poll began | `/api/devices/status` and the monitor probe independently, so the poll that started earlier can finish later and republish the older view |
+| `learnPending` | we just cast, so the next poll names our app | see `learnedCastApp` |
 
-Only a cast of *ours* writes `castURLs`: a device merely observed playing gets no
-entry, so one already up when the process starts is left alone rather than restarted.
+The zero value is a device we have never touched, which is what an absent entry used
+to mean: not playing, no error, nothing known about the screen, and two timestamps
+older than any poll. Only a cast of *ours* sets `url`, so a device merely observed
+playing has none and one already up when the process starts is left alone rather than
+restarted.
 
-A live `castErrors` entry is the *third* reason to cast, alongside "idle" and "stale
-URL", and it covers the normal failure shape for an always-on dashboard: `cast_site`
-fails, the page it was replacing is still up, the next probe reports the device as
-playing, and `setCastError` has already dropped the `castURLs` entry — so "playing, not
-foreign, not stale" skipped the device for the life of the process. Which is also why an
+A live `err` is the *third* reason to cast, alongside "idle" and "stale URL", and it
+covers the normal failure shape for an always-on dashboard: `cast_site` fails, the page
+it was replacing is still up, the next probe reports the device as playing, and
+`setCastError` has already cleared `url` — so "playing, not foreign, not stale" skipped
+the device for the life of the process. Which is also why an
 observation *never* clears an error, playing or idle: "playing something" is not evidence
 that our cast worked. Only `setCastState` clears one. The cost is that a device nothing
 is auto-casting keeps a red error beside a healthy "Playing" until someone casts to it
@@ -246,7 +253,7 @@ since it never returns.
 
 **A cast is reported before it happens.** `/api/devices/cast` and `/stop` answer
 immediately and run `catt` in a goroutine, so failures can't ride on the HTTP response.
-They land in `castErrors` and get merged into the next `/api/devices/status` payload.
+They land in the cast state and get merged into the next `/api/devices/status` payload.
 Those goroutines deliberately use `context.Background()`, not `r.Context()`, which is
 already cancelled by the time they run.
 
@@ -323,11 +330,20 @@ fallback — and streams progress over SSE. Four things to know:
   from the code. Write new ones in the same register.
 - `normalizeConfig` is the single place defaults, clamps and trimming happen, so what
   gets stored, what `GET /api/config` returns, and what the monitor acts on can't
-  disagree. Put new validation there, not in the handler.
+  disagree. Put new validation there, not in the handler — `checkInterval` used to
+  re-clamp the interval, which could only ever differ from the value the UI was
+  showing.
+- **`newMux` is the whole routing table, method included.** Each API path is
+  registered twice: once as `"GET /path"` and once bare. The bare one answers 405 with
+  `Allow`, and it is not redundant — the mux only synthesises a 405 when *no* pattern
+  matches, and the file server's `"/"` matches everything, so without it a wrong-method
+  request comes back as the file server's 404. `handleScan` additionally refuses `HEAD`
+  by hand, because a `"GET"` pattern matches `HEAD` too and that endpoint would run a
+  254-host scan to answer one.
 - `/api/devices/status` fans out one goroutine per device and writes results **by
   index**, not `append` — appending ordered them by whichever device answered first, so
   the UI list reshuffled on every poll. `getDeviceStatus` is the layer that merges a
-  stale `castErrors` entry over `getLiveStatus`; keep the live result winning when both
+  stale cast error over `getLiveStatus`; keep the live result winning when both
   have something to say.
 - The frontend has **no build step**. Alpine.js and Tailwind load from CDNs, so the page
   needs internet access even though the service is LAN-only. Adding tooling here would

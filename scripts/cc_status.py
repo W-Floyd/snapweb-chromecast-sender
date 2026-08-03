@@ -104,7 +104,7 @@ def main():
     # os._exit skips the finally block below on purpose: a disconnect that is
     # already wedged is exactly what we are escaping.
     def on_timeout():
-        emit({"error": "timed out after %ds querying %s" % (OVERALL_TIMEOUT, host)})
+        emit({"error": f"timed out after {OVERALL_TIMEOUT}s querying {host}"})
         os._exit(1)
 
     watchdog = threading.Timer(OVERALL_TIMEOUT, on_timeout)
@@ -114,7 +114,7 @@ def main():
     cast = None
     try:
         if not reachable(host):
-            emit({"error": "%s is not reachable on port %d" % (host, CHROMECAST_PORT)})
+            emit({"error": f"{host} is not reachable on port {CHROMECAST_PORT}"})
             sys.exit(1)
 
         import pychromecast
@@ -124,7 +124,7 @@ def main():
         cast.wait(timeout=CONNECT_TIMEOUT)
         s = cast.status
         if s is None:
-            emit({"error": "no status received from %s" % host})
+            emit({"error": f"no status received from {host}"})
             sys.exit(1)
 
         # Both device-supplied strings are bounded, for the same reason the error

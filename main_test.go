@@ -180,7 +180,7 @@ func TestPostConfigRejectsBodiesThatWouldSilentlyWipeIt(t *testing.T) {
 		`{"check_interval":30} trailing`,
 	} {
 		rec := httptest.NewRecorder()
-		handleConfig(rec, httptest.NewRequest(http.MethodPost, "/api/config", strings.NewReader(body)))
+		handleConfigPost(rec, httptest.NewRequest(http.MethodPost, "/api/config", strings.NewReader(body)))
 		if rec.Code != http.StatusBadRequest {
 			t.Errorf("POST %q = %d, want 400", body, rec.Code)
 		}
@@ -206,7 +206,7 @@ func TestPostConfigRejectsBodiesThatWouldSilentlyWipeIt(t *testing.T) {
 	// A well-formed replacement must still get through, trailing newline and all
 	// — a JSON encoder writing to the wire adds one.
 	rec := httptest.NewRecorder()
-	handleConfig(rec, httptest.NewRequest(http.MethodPost, "/api/config",
+	handleConfigPost(rec, httptest.NewRequest(http.MethodPost, "/api/config",
 		strings.NewReader(`{"check_interval":45,"default_url":"http://new/","devices":[]}`+"\n")))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("valid POST = %d (%s), want 200", rec.Code, rec.Body)
@@ -342,13 +342,9 @@ func TestCastErrorRecordedAndCleared(t *testing.T) {
 
 func resetCastState() {
 	castStatesMu.Lock()
-	castStates, castErrors = map[string]bool{}, map[string]string{}
-	castActions = map[string]time.Time{}
-	castObserved = map[string]time.Time{}
-	castLearnPending = map[string]bool{}
-	castURLs = map[string]string{}
+	defer castStatesMu.Unlock()
+	castStates = map[string]castState{}
 	learnedCastApp, castAppCandidate = "", ""
-	castStatesMu.Unlock()
 }
 
 // learnCastApp drives the two-cast agreement that teaches us our own app id.
@@ -910,7 +906,10 @@ func TestOlderObservationDoesNotOverwriteNewerObservation(t *testing.T) {
 	}
 }
 
-func TestPruneCastStatesDropsActions(t *testing.T) {
+// A device that comes *back* under the same deviceKey must not inherit the state of
+// the one that left — a resurrected error is the visible one: a red message on the
+// card of a device nothing has failed on yet.
+func TestPruneCastStatesDropsDepartedDevices(t *testing.T) {
 	resetCastState()
 	dev := DeviceConfig{Name: "Gone", Host: "1.2.3.4"}
 	setCastState(dev, true, "http://dash/")
@@ -919,22 +918,19 @@ func TestPruneCastStatesDropsActions(t *testing.T) {
 
 	pruneCastStates(nil)
 
-	// Every map keyed by deviceKey, so a device that comes *back* under the same key
-	// does not inherit the state of the one that left. The castErrors entry is the
-	// visible one: a red error on the card of a device nothing has failed on yet.
 	castStatesMu.RLock()
-	sizes := map[string]int{
-		"castStates":   len(castStates),
-		"castErrors":   len(castErrors),
-		"castActions":  len(castActions),
-		"castObserved": len(castObserved),
-		"castURLs":     len(castURLs),
-	}
+	n := len(castStates)
 	castStatesMu.RUnlock()
-	for name, n := range sizes {
-		if n != 0 {
-			t.Errorf("%s has %d stale entries after prune", name, n)
-		}
+	if n != 0 {
+		t.Errorf("castStates has %d stale entries after prune", n)
+	}
+	// Read back through the accessors too, so a prune that dropped the entry but
+	// left a stale copy anywhere would still show up.
+	if isCasting(dev) || castError(dev) != "" {
+		t.Errorf("a removed device kept state: playing=%v err=%q", isCasting(dev), castError(dev))
+	}
+	if _, ok := lastCastURL(dev); ok {
+		t.Error("a removed device kept its recorded URL")
 	}
 
 	// And a device still in the config keeps its state.
@@ -1992,7 +1988,7 @@ func TestHandleConfigGET(t *testing.T) {
 	withConfig(t, Config{CheckInterval: 45, DefaultURL: "http://dash/", Devices: []DeviceConfig{}})
 
 	rec := httptest.NewRecorder()
-	handleConfig(rec, httptest.NewRequest(http.MethodGet, "/api/config", nil))
+	handleConfigGet(rec, httptest.NewRequest(http.MethodGet, "/api/config", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("GET = %d", rec.Code)
 	}
@@ -2005,13 +2001,6 @@ func TestHandleConfigGET(t *testing.T) {
 		t.Errorf("empty device list did not marshal as []: %s", rec.Body)
 	}
 
-	for _, method := range []string{http.MethodPut, http.MethodDelete, http.MethodPatch} {
-		rec := httptest.NewRecorder()
-		handleConfig(rec, httptest.NewRequest(method, "/api/config", nil))
-		if rec.Code != http.StatusMethodNotAllowed {
-			t.Errorf("%s /api/config = %d, want 405", method, rec.Code)
-		}
-	}
 }
 
 // GET must not hand out the live slice: the caller would then be reading the
@@ -2020,7 +2009,7 @@ func TestHandleConfigGETCopiesTheDeviceSlice(t *testing.T) {
 	withConfig(t, Config{CheckInterval: 60, Devices: []DeviceConfig{{Name: "Lounge"}}})
 
 	rec := httptest.NewRecorder()
-	handleConfig(rec, httptest.NewRequest(http.MethodGet, "/api/config", nil))
+	handleConfigGet(rec, httptest.NewRequest(http.MethodGet, "/api/config", nil))
 	var got Config
 	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 		t.Fatal(err)
@@ -2047,7 +2036,7 @@ func TestOversizedBodiesAreRejectedAsTooLarge(t *testing.T) {
 		path    string
 		handler func(http.ResponseWriter, *http.Request)
 	}{
-		{"config", "/api/config", handleConfig},
+		{"config", "/api/config", handleConfigPost},
 		{"cast", "/api/devices/cast", handleCast},
 		{"stop", "/api/devices/stop", handleStop},
 	}
@@ -2078,7 +2067,7 @@ func TestFailedSaveNeitherPublishesNorPrunes(t *testing.T) {
 	setCastState(kept, true, "http://dash/")
 
 	rec := httptest.NewRecorder()
-	handleConfig(rec, httptest.NewRequest(http.MethodPost, "/api/config",
+	handleConfigPost(rec, httptest.NewRequest(http.MethodPost, "/api/config",
 		strings.NewReader(`{"check_interval":99,"devices":[]}`)))
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("unwritable config = %d, want 500", rec.Code)
@@ -2106,7 +2095,7 @@ func TestSuccessfulSavePrunesRemovedDevices(t *testing.T) {
 	setCastState(stays, true, "http://dash/")
 
 	rec := httptest.NewRecorder()
-	handleConfig(rec, httptest.NewRequest(http.MethodPost, "/api/config",
+	handleConfigPost(rec, httptest.NewRequest(http.MethodPost, "/api/config",
 		strings.NewReader(`{"check_interval":30,"devices":[{"name":"Stays","host":"5.6.7.8"}]}`)))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("save = %d (%s)", rec.Code, rec.Body)
@@ -2141,7 +2130,7 @@ func TestSavingSignalsTheMonitorWithoutBlocking(t *testing.T) {
 	done := make(chan int, 1)
 	go func() {
 		rec := httptest.NewRecorder()
-		handleConfig(rec, httptest.NewRequest(http.MethodPost, "/api/config",
+		handleConfigPost(rec, httptest.NewRequest(http.MethodPost, "/api/config",
 			strings.NewReader(`{"check_interval":20,"devices":[]}`)))
 		done <- rec.Code
 	}()
@@ -2211,16 +2200,6 @@ func TestLoadConfig(t *testing.T) {
 // Neither handler may reach catt without an addressable device and, for a cast,
 // a URL catt's cast_site can actually be given.
 func TestCastAndStopValidation(t *testing.T) {
-	for _, method := range []string{http.MethodGet, http.MethodPut, http.MethodDelete} {
-		for name, h := range map[string]func(http.ResponseWriter, *http.Request){"cast": handleCast, "stop": handleStop} {
-			rec := httptest.NewRecorder()
-			h(rec, httptest.NewRequest(method, "/api/devices/"+name, nil))
-			if rec.Code != http.StatusMethodNotAllowed {
-				t.Errorf("%s %s = %d, want 405", method, name, rec.Code)
-			}
-		}
-	}
-
 	castCases := []struct{ body, wantIn string }{
 		// Reported separately: one message covering both read as though the device
 		// itself were the problem when only the URL was blank.
@@ -2303,14 +2282,6 @@ func TestCastAndStopRefuseAConcatenatedBody(t *testing.T) {
 
 func TestHandleDeviceStatus(t *testing.T) {
 	withConfig(t, Config{CheckInterval: 60, Devices: []DeviceConfig{}})
-
-	for _, method := range []string{http.MethodPost, http.MethodPut} {
-		rec := httptest.NewRecorder()
-		handleDeviceStatus(rec, httptest.NewRequest(method, "/api/devices/status", nil))
-		if rec.Code != http.StatusMethodNotAllowed {
-			t.Errorf("%s = %d, want 405", method, rec.Code)
-		}
-	}
 
 	// An empty list must marshal as [] and never null — the UI iterates it.
 	rec := httptest.NewRecorder()
@@ -2714,14 +2685,6 @@ func TestPychromecastStatusReportsCancellation(t *testing.T) {
 // --- /api/subnets -----------------------------------------------------------
 
 func TestHandleSubnets(t *testing.T) {
-	for _, method := range []string{http.MethodPost, http.MethodDelete} {
-		rec := httptest.NewRecorder()
-		handleSubnets(rec, httptest.NewRequest(method, "/api/subnets", nil))
-		if rec.Code != http.StatusMethodNotAllowed {
-			t.Errorf("%s = %d, want 405", method, rec.Code)
-		}
-	}
-
 	rec := httptest.NewRecorder()
 	handleSubnets(rec, httptest.NewRequest(http.MethodGet, "/api/subnets", nil))
 	if rec.Code != http.StatusOK {
@@ -2753,17 +2716,6 @@ func TestHandleSubnets(t *testing.T) {
 }
 
 // --- /api/devices/scan ------------------------------------------------------
-
-// This endpoint probes every host on a /24, so nothing but a GET may start it.
-func TestHandleScanRejectsNonGET(t *testing.T) {
-	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodHead} {
-		rec := httptest.NewRecorder()
-		handleScan(rec, httptest.NewRequest(method, "/api/devices/scan", nil))
-		if rec.Code != http.StatusMethodNotAllowed {
-			t.Errorf("%s = %d, want 405", method, rec.Code)
-		}
-	}
-}
 
 // The reason has to ride on the terminating event: the UI overwrites its status
 // line when the stream ends, so a reason sent as a "status" was replaced by the
@@ -3674,5 +3626,71 @@ func TestTCPScanIgnoresAHostThatAnswersWithoutSpeakingHTTP(t *testing.T) {
 	}
 	if len(devices) != 0 {
 		t.Errorf("devices = %+v, want none", devices)
+	}
+}
+
+// --- routing ----------------------------------------------------------------
+
+// The method is part of the route, so it is asserted through the real mux rather
+// than by calling handlers directly with the wrong verb — five separate loops that
+// proved each handler policed itself, and none of which would have noticed the
+// routing table disagreeing with them.
+//
+// Two of these endpoints refuse the wrong method for more than tidiness:
+// /devices/scan opens a connection to every host on a /24, and /devices/status
+// fans out a subprocess per configured device.
+func TestRoutingEnforcesTheMethod(t *testing.T) {
+	withConfig(t, Config{CheckInterval: 60, Devices: []DeviceConfig{}})
+	// The allowed-method probe below reaches the scan handler for real, and the real
+	// stages would shell out to catt and then probe 254 hosts of whichever LAN this
+	// is running on. No device list, so /devices/status probes nothing by itself.
+	withScanners(t,
+		func(context.Context) []DiscoveredDevice { return nil },
+		func(context.Context, []string, func(string), func(DiscoveredDevice), func(int, int)) ([]DiscoveredDevice, string) {
+			return nil, ""
+		})
+	mux := newMux()
+
+	for _, c := range []struct {
+		path    string
+		allowed string
+		refused []string
+	}{
+		{"/api/config", "GET", []string{"PUT", "DELETE", "PATCH"}},
+		{"/api/config", "POST", nil},
+		{"/api/subnets", "GET", []string{"POST", "DELETE"}},
+		{"/api/devices/status", "GET", []string{"POST", "PUT"}},
+		{"/api/devices/cast", "POST", []string{"GET", "PUT", "DELETE"}},
+		{"/api/devices/stop", "POST", []string{"GET", "PUT", "DELETE"}},
+		// HEAD is the one a "GET" pattern lets through on its own, and the one this
+		// endpoint cannot afford: the scan would run and the answer be discarded.
+		{"/api/devices/scan", "GET", []string{"POST", "PUT", "HEAD"}},
+	} {
+		for _, method := range c.refused {
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, httptest.NewRequest(method, c.path, nil))
+			if rec.Code != http.StatusMethodNotAllowed {
+				t.Errorf("%s %s = %d, want 405", method, c.path, rec.Code)
+			}
+			// 405 without Allow tells the caller it guessed wrong and nothing else.
+			if got := rec.Header().Get("Allow"); !strings.Contains(got, c.allowed) {
+				t.Errorf("%s %s: Allow = %q, want it to name %s", method, c.path, got, c.allowed)
+			}
+		}
+		// And the allowed method reaches its handler. Body-less, so the POSTs answer
+		// 400 rather than 200 — either way the route resolved.
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest(c.allowed, c.path, strings.NewReader("")))
+		if rec.Code == http.StatusMethodNotAllowed || rec.Code == http.StatusNotFound {
+			t.Errorf("%s %s = %d, want it routed to a handler", c.allowed, c.path, rec.Code)
+		}
+	}
+
+	// Anything not registered still falls through to the file server rather than
+	// 405ing, whatever the method.
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/index.html", nil))
+	if rec.Code == http.StatusMethodNotAllowed {
+		t.Error("the static file route answered 405")
 	}
 }

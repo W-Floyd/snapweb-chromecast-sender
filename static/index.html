@@ -69,11 +69,7 @@
             <div class="flex items-start justify-between mb-4">
               <div class="flex items-center gap-3">
                 <div class="w-2 h-2 rounded-full flex-shrink-0"
-                     :class="(s => ({
-                       'bg-emerald-400': s && s !== 'buffering' && !['idle','unknown',''].includes(s),
-                       'bg-yellow-400 animate-pulse': s === 'buffering',
-                       'bg-slate-500': !s || ['idle','unknown',''].includes(s),
-                     }))(statusFor(device, i)?.state?.toLowerCase())">
+                     :class="stateDotClass(statusFor(device, i)?.state)">
                 </div>
                 <div>
                   <!-- Fall back to the IP: a device added from a scan and then
@@ -394,6 +390,19 @@
           if (!s) return undefined
           const same = (a, b) => (a || '') === (b || '')
           return same(s.name, device.name) && same(s.host, device.host) ? s : undefined
+        },
+
+        // The colour of a device card's status dot. In the component rather than an
+        // inline arrow function in the :class binding, where the three states and
+        // their overlapping conditions were a single unreadable expression.
+        //
+        // "No status yet" and "idle" deliberately look the same: a device we cannot
+        // currently describe is not worth a colour of its own.
+        stateDotClass(state) {
+          const s = (state || '').toLowerCase()
+          if (s === 'buffering') return 'bg-yellow-400 animate-pulse'
+          if (!s || ['idle', 'unknown'].includes(s)) return 'bg-slate-500'
+          return 'bg-emerald-400'
         },
 
         scanPercent() {

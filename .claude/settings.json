@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(go vet *)",
+      "Bash(gofmt -l .)",
+      "Bash(go test *)"
+    ]
+  }
+}

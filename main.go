@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
@@ -89,42 +90,9 @@ var (
 	staticDir    = "/static"
 	statusScript = "/usr/local/lib/chromecast/cc_status.py"
 
-	// castStates tracks devices we have actively cast to, keyed by deviceKey.
-	// catt gives no signal for web-page cast state, so we track it ourselves.
-	castStates = map[string]bool{}
-	// castErrors holds why the most recent cast/stop attempt failed, keyed by
-	// deviceKey. /api/devices/cast answers before catt has run, so without this
-	// a failed cast looks identical to a successful one in the UI — the device
-	// just quietly stays idle and the reason is only ever in the server log.
-	castErrors = map[string]string{}
-	// castURLs records the URL of the most recent cast *we* made, keyed by
-	// deviceKey. Without it the isCasting skip in monitorDevices held for as long
-	// as the device kept showing the old page — which for an always-on dashboard
-	// is forever — so saving a new URL, or a new default_url, looked like it had
-	// done nothing at all. That is the same silent no-op the interval re-read in
-	// monitorLoop exists to prevent.
-	//
-	// An entry exists only when we know what we put on screen. A device merely
-	// *observed* playing (one already showing something when the process started)
-	// gets none, because re-casting on that guess would restart a dashboard that
-	// was already correct.
-	castURLs = map[string]string{}
-	// castActions records when we last *acted* on a device (a cast or stop we
-	// initiated), keyed by deviceKey. A status probe takes seconds, so a probe
-	// that started before the cast can return after it and report the device as
-	// still idle — last-writer-wins then erased the fresh state, the monitor
-	// re-cast a device that was already playing, and a fresh cast error was
-	// cleared by an observation older than the failure. Observations older than
-	// the last action are stale by definition and get dropped.
-	castActions = map[string]time.Time{}
-	// castObserved records when the newest *applied* status poll began, keyed by
-	// deviceKey. castActions above only orders polls against our own casts, and
-	// polls also race each other: /api/devices/status (browser, every 30s) and the
-	// monitor loop probe the same device independently, each taking up to 15s, so
-	// the one that started earlier can easily finish later. Last-writer-wins then
-	// republished the older view — a device seen playing flipped back to "Idle"
-	// until the next tick, and the monitor could re-cast something already up.
-	castObserved = map[string]time.Time{}
+	// castStates is what we know about each device, keyed by deviceKey. See
+	// castState — catt gives no signal for web-page cast state, so we track it.
+	castStates = map[string]castState{}
 	// learnedCastApp is the receiver app id our own casts run under (catt's
 	// cast_site uses DashCast). It is learned from the first status poll after a
 	// cast we initiated rather than hardcoded: a wrong constant here would make
@@ -166,6 +134,52 @@ var (
 	scanInFlight atomic.Bool
 )
 
+// castState is everything we know about one device. One struct rather than the six
+// parallel maps this used to be: they shared a key and a mutex, were always written
+// together, and every one of them had to be named again in pruneCastStates — where a
+// map added to the set and forgotten in the prune leaves state behind for whatever
+// device next takes that key. There is nothing to forget now.
+//
+// The zero value is the state of a device we have never touched, which is what an
+// absent entry used to be: not playing, no error, nothing known about the page on
+// screen, and two zero timestamps that are older than any poll or action.
+type castState struct {
+	// playing is "the device is showing something", not "showing ours" — a person
+	// casting Netflix sets it too. Telling those apart needs appID, below.
+	playing bool
+	// err is why our most recent cast or stop failed. /api/devices/cast answers
+	// before catt has run, so without it a failed cast looks identical in the UI to
+	// a successful one: the device quietly stays idle and the reason only ever
+	// reaches the server log.
+	err string
+	// url is the page *we* last put on screen. Empty means we did not put it there
+	// and so know nothing about whether it is current — an entry recorded for a
+	// device merely *observed* playing would make the monitor re-cast a dashboard
+	// that was already correct. Without this the isCasting skip in monitorDevices
+	// held for as long as the device kept showing the old page, which for an
+	// always-on dashboard is forever, so editing default_url did nothing at all.
+	//
+	// Empty is a safe marker for "unknown" because a URL we would cast is never
+	// empty: castableURL rejects it and autoCastTargets skips the row.
+	url string
+	// actedAt is when we last cast or stopped this device. A status probe takes
+	// seconds, so one that started before the cast can return after it and report
+	// the device as still idle — last-writer-wins then erased the fresh state, the
+	// monitor re-cast a device that was already playing, and a fresh cast error was
+	// cleared by an observation older than the failure.
+	actedAt time.Time
+	// observedAt is when the newest *applied* poll began. actedAt only orders polls
+	// against our own casts, and polls also race each other: /api/devices/status
+	// (browser, every 30s) and the monitor probe the same device independently, each
+	// taking up to 15s, so the one that started earlier can easily finish later.
+	// Last-writer-wins then republished the older view — a device seen playing
+	// flipped back to "Idle" until the next tick.
+	observedAt time.Time
+	// learnPending marks a device we have just cast to, whose next poll therefore
+	// identifies the app our own casts run as. See learnedCastApp.
+	learnPending bool
+}
+
 // deviceKey identifies a device for cast-state tracking. Friendly names are not
 // unique — two Chromecasts can legitimately share one — so prefer the IP when
 // we have it, otherwise state for one device leaks onto the other.
@@ -199,36 +213,29 @@ func deviceLabel(dev DeviceConfig) string {
 func setCastState(dev DeviceConfig, playing bool, url string) {
 	k := deviceKey(dev)
 	castStatesMu.Lock()
-	castStates[k] = playing
-	castActions[k] = time.Now()
-	delete(castErrors, k)
+	defer castStatesMu.Unlock()
+	s := castStates[k]
+	s.playing, s.actedAt, s.err = playing, time.Now(), ""
+	// A stop leaves nothing of ours on screen, and neither does a cast we cannot
+	// name a URL for, so both drop the recorded page and disarm the learner.
+	s.url = ""
+	s.learnPending = false
 	if playing {
-		// Absent rather than empty when we have no URL to record: castURLs means
-		// "we know what is on screen", and an empty string there would read as a
-		// known URL that no configured device can ever match, re-casting on every
-		// tick.
-		if url != "" {
-			castURLs[k] = url
-		} else {
-			delete(castURLs, k)
-		}
+		s.url = url
 		// Whatever the next poll finds running is what our cast runs as.
-		castLearnPending[k] = true
-	} else {
-		delete(castURLs, k)
-		delete(castLearnPending, k)
+		s.learnPending = true
 	}
-	castStatesMu.Unlock()
+	castStates[k] = s
 }
 
-// lastCastURL returns the page we most recently cast to dev, and whether we
-// have one at all. "No entry" is not "no URL": it means we did not put what is
-// on screen there, so nothing may be concluded about whether it is current.
+// lastCastURL returns the page we most recently cast to dev, and whether we know
+// it at all. "Not known" is not "no URL": it means we did not put what is on
+// screen there, so nothing may be concluded about whether it is current.
 func lastCastURL(dev DeviceConfig) (string, bool) {
 	castStatesMu.RLock()
 	defer castStatesMu.RUnlock()
-	u, ok := castURLs[deviceKey(dev)]
-	return u, ok
+	u := castStates[deviceKey(dev)].url
+	return u, u != ""
 }
 
 // observeCastState records what a status poll saw, without disturbing a recorded
@@ -259,14 +266,17 @@ func observeCastState(dev DeviceConfig, playing bool, appID string, observedAt t
 	k := deviceKey(dev)
 	castStatesMu.Lock()
 	defer castStatesMu.Unlock()
-	if acted, ok := castActions[k]; ok && observedAt.Before(acted) {
+	s := castStates[k]
+	// Both zero times are older than any real poll, so a device we have never acted
+	// on or observed needs no special case here.
+	if observedAt.Before(s.actedAt) {
 		return false // this poll predates the cast/stop it would be overwriting
 	}
-	if prev, ok := castObserved[k]; ok && observedAt.Before(prev) {
+	if observedAt.Before(s.observedAt) {
 		return false // an overlapping poll already reported a later view
 	}
-	castObserved[k] = observedAt
-	if castLearnPending[k] {
+	s.observedAt = observedAt
+	if s.learnPending {
 		// The flag is consumed by the *first* applied poll after our cast, whatever
 		// that poll found. Disarming unconditionally is the point: left armed it
 		// never expired, and an hours-later poll — by which time somebody had
@@ -279,7 +289,7 @@ func observeCastState(dev DeviceConfig, playing bool, appID string, observedAt t
 		// today on an invariant in cc_status.py (an empty app_id is reported as
 		// idle); keeping the flag armed for it would make a drift over there
 		// reappear here as the mislearn this exists to prevent.
-		delete(castLearnPending, k)
+		s.learnPending = false
 		if playing && appID != "" {
 			if castAppCandidate == appID {
 				learnedCastApp = appID
@@ -294,7 +304,8 @@ func observeCastState(dev DeviceConfig, playing bool, appID string, observedAt t
 			}
 		}
 	}
-	castStates[k] = playing
+	s.playing = playing
+	castStates[k] = s
 	return true
 }
 
@@ -309,7 +320,7 @@ func isForeignApp(appID string) bool {
 func isCasting(dev DeviceConfig) bool {
 	castStatesMu.RLock()
 	defer castStatesMu.RUnlock()
-	return castStates[deviceKey(dev)]
+	return castStates[deviceKey(dev)].playing
 }
 
 // maxStatusTextLen bounds any subprocess-supplied string we put in a
@@ -344,71 +355,42 @@ func boundText(msg string, limit int) string {
 }
 
 func setCastError(dev DeviceConfig, msg string) {
-	msg = shortText(msg)
 	k := deviceKey(dev)
 	castStatesMu.Lock()
-	castStates[k] = false
-	castErrors[k] = msg
+	defer castStatesMu.Unlock()
+	s := castStates[k]
+	s.playing, s.err = false, shortText(msg)
 	// A failure is an action too: without this an in-flight poll that saw the
 	// device playing could land afterwards and delete the error we just recorded.
-	castActions[k] = time.Now()
-	// Nothing of ours is on screen, so we no longer know what is — the same
-	// reasoning that disarms the learn flag below.
-	delete(castURLs, k)
-	// Disarm the learn flag. Nothing of ours is running, so the next app to
-	// appear on this device is somebody else's — and learning *that* as our own
-	// makes the real dashboard read as foreign, fleet-wide, and re-cast on every
-	// tick, which is exactly what learning the id instead of hardcoding it
+	s.actedAt = time.Now()
+	// Nothing of ours is on screen, so we no longer know what is.
+	s.url = ""
+	// Disarm the learner for the same reason. Nothing of ours is running, so the
+	// next app to appear on this device is somebody else's — and learning *that* as
+	// our own makes the real dashboard read as foreign, fleet-wide, and re-cast on
+	// every tick, which is exactly what learning the id instead of hardcoding it
 	// exists to prevent.
-	delete(castLearnPending, k)
-	castStatesMu.Unlock()
+	s.learnPending = false
+	castStates[k] = s
 }
 
 func castError(dev DeviceConfig) string {
 	castStatesMu.RLock()
 	defer castStatesMu.RUnlock()
-	return castErrors[deviceKey(dev)]
+	return castStates[deviceKey(dev)].err
 }
 
 // pruneCastStates drops entries for devices no longer in the config, so the map
-// does not grow without bound across edits over the process lifetime.
+// does not grow without bound across edits over the process lifetime. One map, so
+// there is no longer a set of them to keep this in step with.
 func pruneCastStates(devices []DeviceConfig) {
 	keep := make(map[string]bool, len(devices))
 	for _, d := range devices {
 		keep[deviceKey(d)] = true
 	}
 	castStatesMu.Lock()
-	for k := range castStates {
-		if !keep[k] {
-			delete(castStates, k)
-		}
-	}
-	for k := range castErrors {
-		if !keep[k] {
-			delete(castErrors, k)
-		}
-	}
-	for k := range castActions {
-		if !keep[k] {
-			delete(castActions, k)
-		}
-	}
-	for k := range castObserved {
-		if !keep[k] {
-			delete(castObserved, k)
-		}
-	}
-	for k := range castLearnPending {
-		if !keep[k] {
-			delete(castLearnPending, k)
-		}
-	}
-	for k := range castURLs {
-		if !keep[k] {
-			delete(castURLs, k)
-		}
-	}
-	castStatesMu.Unlock()
+	defer castStatesMu.Unlock()
+	maps.DeleteFunc(castStates, func(k string, _ castState) bool { return !keep[k] })
 }
 
 // normalizeConfig fills in defaults and clamps values so that what we store,
@@ -1251,79 +1233,76 @@ func decodeOneObject(body io.Reader, v any) error {
 	return nil
 }
 
-func handleConfig(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		w.Header().Set("Content-Type", "application/json")
-		cfgMu.RLock()
-		snapshot := cfg
-		snapshot.Devices = append([]DeviceConfig{}, cfg.Devices...)
-		cfgMu.RUnlock()
-		// Encode outside the lock: a slow client would otherwise block every
-		// config writer for as long as it takes to drain the response.
-		json.NewEncoder(w).Encode(snapshot)
-	case http.MethodPost:
-		// Bound the body — this endpoint is unauthenticated on the LAN, and
-		// json.Decode on an unbounded stream will happily consume all memory.
-		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-		// Decode into a *pointer* so a body of `null` is distinguishable from an
-		// object. Into a Config it decodes without error and leaves the zero
-		// value, which normalizeConfig then turns into a perfectly valid "no
-		// devices, no default URL, 60s" config — so a client that sent `null`
-		// (a serialiser given an absent value, a proxy rewriting the body) had
-		// every device deleted from disk and every cast state pruned, and got a
-		// 200 for it. This endpoint replaces the whole config, so it must not
-		// treat "no value" as "the empty value".
-		//
-		// Anything after that object is refused too (see decodeOneObject): the half
-		// that would be dropped here is a device list.
-		var decoded *Config
-		if err := decodeOneObject(r.Body, &decoded); err != nil {
-			rejectBody(w, err)
-			return
-		}
-		if decoded == nil {
-			http.Error(w, "config body must be a JSON object", http.StatusBadRequest)
-			return
-		}
-		newCfg := *decoded
-		normalizeConfig(&newCfg)
-		// Persist before publishing, and serialise the whole write-then-publish
-		// so it stays atomic against a second POST. Applying first meant a failed
-		// write left the monitor acting on a config the disk never got — the user
-		// saw a 500, and a restart silently reverted behaviour to the old file.
-		// Two concurrent POSTs could likewise rename in the opposite order to the
-		// one they published in, leaving memory and disk permanently disagreeing.
-		cfgSaveMu.Lock()
-		err := saveConfig(newCfg)
-		if err == nil {
-			cfgMu.Lock()
-			cfg = newCfg
-			cfgMu.Unlock()
-			// Devices can be renamed, re-addressed or deleted here; drop the cast
-			// state of anything that no longer exists. After the save, so a rejected
-			// write does not discard the state of devices that are still configured
-			// — and inside cfgSaveMu, or a slower concurrent POST could prune
-			// against its own older device list and delete the state of devices the
-			// published config still has, re-casting them for no reason.
-			pruneCastStates(newCfg.Devices)
-		}
-		cfgSaveMu.Unlock()
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		// A changed interval only takes effect if the monitor stops waiting out
-		// the old one; see monitorLoop.
-		select {
-		case configChanged <- struct{}{}:
-		default:
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-	default:
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+func handleConfigGet(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	cfgMu.RLock()
+	snapshot := cfg
+	snapshot.Devices = append([]DeviceConfig{}, cfg.Devices...)
+	cfgMu.RUnlock()
+	// Encode outside the lock: a slow client would otherwise block every
+	// config writer for as long as it takes to drain the response.
+	json.NewEncoder(w).Encode(snapshot)
+}
+
+func handleConfigPost(w http.ResponseWriter, r *http.Request) {
+	// Bound the body — this endpoint is unauthenticated on the LAN, and
+	// json.Decode on an unbounded stream will happily consume all memory.
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	// Decode into a *pointer* so a body of `null` is distinguishable from an
+	// object. Into a Config it decodes without error and leaves the zero
+	// value, which normalizeConfig then turns into a perfectly valid "no
+	// devices, no default URL, 60s" config — so a client that sent `null`
+	// (a serialiser given an absent value, a proxy rewriting the body) had
+	// every device deleted from disk and every cast state pruned, and got a
+	// 200 for it. This endpoint replaces the whole config, so it must not
+	// treat "no value" as "the empty value".
+	//
+	// Anything after that object is refused too (see decodeOneObject): the half
+	// that would be dropped here is a device list.
+	var decoded *Config
+	if err := decodeOneObject(r.Body, &decoded); err != nil {
+		rejectBody(w, err)
+		return
 	}
+	if decoded == nil {
+		http.Error(w, "config body must be a JSON object", http.StatusBadRequest)
+		return
+	}
+	newCfg := *decoded
+	normalizeConfig(&newCfg)
+	// Persist before publishing, and serialise the whole write-then-publish
+	// so it stays atomic against a second POST. Applying first meant a failed
+	// write left the monitor acting on a config the disk never got — the user
+	// saw a 500, and a restart silently reverted behaviour to the old file.
+	// Two concurrent POSTs could likewise rename in the opposite order to the
+	// one they published in, leaving memory and disk permanently disagreeing.
+	cfgSaveMu.Lock()
+	err := saveConfig(newCfg)
+	if err == nil {
+		cfgMu.Lock()
+		cfg = newCfg
+		cfgMu.Unlock()
+		// Devices can be renamed, re-addressed or deleted here; drop the cast
+		// state of anything that no longer exists. After the save, so a rejected
+		// write does not discard the state of devices that are still configured
+		// — and inside cfgSaveMu, or a slower concurrent POST could prune
+		// against its own older device list and delete the state of devices the
+		// published config still has, re-casting them for no reason.
+		pruneCastStates(newCfg.Devices)
+	}
+	cfgSaveMu.Unlock()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	// A changed interval only takes effect if the monitor stops waiting out
+	// the old one; see monitorLoop.
+	select {
+	case configChanged <- struct{}{}:
+	default:
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 func cattScan(ctx context.Context) []DiscoveredDevice {
@@ -1434,19 +1413,13 @@ func collectSubnets(skipVirtual bool) []string {
 		}
 		addrs, _ := iface.Addrs()
 		for _, addr := range addrs {
-			var ip net.IP
-			switch v := addr.(type) {
-			case *net.IPNet:
-				ip = v.IP
-			case *net.IPAddr:
-				ip = v.IP
-			}
-			v4 := net.IP(nil)
-			if ip != nil {
-				v4 = ip.To4()
+			ipnet, ok := addr.(*net.IPNet)
+			if !ok {
+				continue
 			}
 			// Skip link-local (169.254/16): an interface that failed DHCP has
 			// no peers worth probing.
+			v4 := ipnet.IP.To4()
 			if v4 == nil || v4.IsLinkLocalUnicast() {
 				continue
 			}
@@ -1539,10 +1512,6 @@ func parseSubnet(s string) string {
 }
 
 func handleSubnets(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	w.Header().Set("Content-Type", "application/json")
 	bases := localSubnets()
 	cidrs := make([]string, len(bases)) // non-nil, so it marshals as [] not null
@@ -1643,7 +1612,7 @@ func tcpScan(ctx context.Context, subnets []string, onStatus func(string), onFou
 		for i := 1; i <= 254; i++ {
 			host := fmt.Sprintf("%s.%d", subnet, i)
 			wg.Add(1)
-			go func(h string) {
+			go func() {
 				defer wg.Done()
 				sem <- struct{}{}
 				defer func() { <-sem }()
@@ -1655,7 +1624,7 @@ func tcpScan(ctx context.Context, subnets []string, onStatus func(string), onFou
 					return
 				}
 
-				addr := net.JoinHostPort(h, strconv.Itoa(chromecastSetupPort))
+				addr := net.JoinHostPort(host, strconv.Itoa(chromecastSetupPort))
 				conn, err := net.DialTimeout("tcp", addr, 400*time.Millisecond)
 				if err != nil {
 					return
@@ -1685,12 +1654,12 @@ func tcpScan(ctx context.Context, subnets []string, onStatus func(string), onFou
 					return
 				}
 
-				d := DiscoveredDevice{Name: info.Name, Host: h}
+				d := DiscoveredDevice{Name: info.Name, Host: host}
 				mu.Lock()
 				devices = append(devices, d)
 				mu.Unlock()
 				onFound(d)
-			}(host)
+			}()
 		}
 	}
 
@@ -1705,10 +1674,12 @@ func tcpScan(ctx context.Context, subnets []string, onStatus func(string), onFou
 }
 
 func handleScan(w http.ResponseWriter, r *http.Request) {
-	// EventSource only ever issues a GET, and this endpoint probes every host on
-	// a /24 — reject anything else rather than let an unrelated request method
-	// kick off a network-wide scan.
-	if r.Method != http.MethodGet {
+	// A "GET" pattern in the mux matches HEAD as well, which is right for every
+	// other endpoint here and wrong for this one: a HEAD reaching the handler would
+	// open a TCP connection to all 254 hosts on the subnet and discard the answer.
+	// Nothing needs the size of an event stream, so refuse it.
+	if r.Method == http.MethodHead {
+		w.Header().Set("Allow", http.MethodGet)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
@@ -1786,12 +1757,6 @@ func handleScan(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleDeviceStatus(w http.ResponseWriter, r *http.Request) {
-	// Read-only, but not cheap: it fans out a subprocess per configured device.
-	// Reject other methods rather than let, say, a stray POST spend 15s per device.
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	w.Header().Set("Content-Type", "application/json")
 	cfgMu.RLock()
 	devices := append([]DeviceConfig{}, cfg.Devices...)
@@ -1809,20 +1774,16 @@ func handleDeviceStatus(w http.ResponseWriter, r *http.Request) {
 	var wg sync.WaitGroup
 	for i, dev := range devices {
 		wg.Add(1)
-		go func(i int, d DeviceConfig) {
+		go func() {
 			defer wg.Done()
-			statuses[i] = getDeviceStatus(r.Context(), d, defaultURL, dups[deviceKey(d)])
-		}(i, dev)
+			statuses[i] = getDeviceStatus(r.Context(), dev, defaultURL, dups[deviceKey(dev)])
+		}()
 	}
 	wg.Wait()
 	json.NewEncoder(w).Encode(statuses)
 }
 
 func handleCast(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	// Bound the body like /api/config does: unauthenticated on the LAN, and an
 	// unbounded json.Decode will consume all available memory.
 	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
@@ -1886,10 +1847,6 @@ func handleCast(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleStop(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
 	var req struct {
 		Name string `json:"name"`
@@ -1919,6 +1876,51 @@ func handleStop(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "stopped"})
 }
 
+// methodNotAllowed answers a request whose path is one of ours but whose method is
+// not, naming the methods that path does serve. A 405 without `Allow` tells the
+// caller it guessed wrong and nothing else, which is what the hand-rolled check at
+// the top of each handler used to send.
+func methodNotAllowed(allow string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Allow", allow)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// newMux routes every endpoint, method included. Putting the method in the pattern
+// keeps the whole routing table in one readable place instead of spread across six
+// `if r.Method != …` guards — and two of these endpoints refuse the wrong method for
+// more than tidiness: /devices/scan opens a connection to every host on a /24, and
+// /devices/status fans out a subprocess per configured device.
+//
+// Each API path also gets a method-less route, which is what actually produces the
+// 405. The mux only synthesises one itself when *no* pattern matches the request,
+// and the file server's "/" below matches everything — so without these, a PUT to
+// /api/config resolved to the file server and came back as its 404.
+func newMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	for path, allow := range map[string]string{
+		"/api/config":         "GET, POST",
+		"/api/subnets":        "GET",
+		"/api/devices/scan":   "GET",
+		"/api/devices/status": "GET",
+		"/api/devices/cast":   "POST",
+		"/api/devices/stop":   "POST",
+	} {
+		mux.HandleFunc(path, methodNotAllowed(allow))
+	}
+	// More specific than the patterns above, so these win for the right method.
+	mux.HandleFunc("GET /api/config", handleConfigGet)
+	mux.HandleFunc("POST /api/config", handleConfigPost)
+	mux.HandleFunc("GET /api/subnets", handleSubnets)
+	mux.HandleFunc("GET /api/devices/scan", handleScan)
+	mux.HandleFunc("GET /api/devices/status", handleDeviceStatus)
+	mux.HandleFunc("POST /api/devices/cast", handleCast)
+	mux.HandleFunc("POST /api/devices/stop", handleStop)
+	mux.Handle("/", http.FileServer(http.Dir(staticDir)))
+	return mux
+}
+
 func main() {
 	if p := os.Getenv("CONFIG_PATH"); p != "" {
 		cfgPath = p
@@ -1935,14 +1937,7 @@ func main() {
 	loadConfig()
 	go monitorLoop()
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/api/config", handleConfig)
-	mux.HandleFunc("/api/subnets", handleSubnets)
-	mux.HandleFunc("/api/devices/scan", handleScan)
-	mux.HandleFunc("/api/devices/status", handleDeviceStatus)
-	mux.HandleFunc("/api/devices/cast", handleCast)
-	mux.HandleFunc("/api/devices/stop", handleStop)
-	mux.Handle("/", http.FileServer(http.Dir(staticDir)))
+	mux := newMux()
 
 	port := "8080"
 	if p := os.Getenv("PORT"); p != "" {

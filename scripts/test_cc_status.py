@@ -265,7 +265,7 @@ class MainTest(unittest.TestCase):
         self.assertLess(len(raw), 64 << 10)
         for field in ("app_id", "display_name"):
             self.assertEqual(len(payload[field]), cc_status.MAX_MESSAGE + 1,
-                             "%s was not clipped" % field)
+                             f"{field} was not clipped")
             self.assertTrue(payload[field].endswith("…"))
         # And a running app stays a running app: the idle rule is applied to the
         # raw id, so clipping cannot turn one value into another.
